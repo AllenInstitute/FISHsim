@@ -1,7 +1,9 @@
 from __future__ import annotations  # for self referencing type hints
 import math
+from typing import List
 import numpy as np
 import numpy.linalg as LA
+from rpds import List
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation
 
@@ -57,7 +59,7 @@ class Ellipsoid:
         return inv_M.T @ A @ inv_M
 
     def random_point(
-        self, radial_extent: list, num_points: int = 1, boundary_box_dim: list = None
+        self, radial_extent: list, num_points: int = 1, boundary_box_dim: list = None, is_physical_coordinates: bool = False
     ) -> np.ndarray:
         """Generates a random point within the volume of the nucleus.
             One can specify which section of the nucleus to sample from by specifying radial extent
@@ -106,9 +108,13 @@ class Ellipsoid:
                 continue
 
             # Checking for duplicates within the cell. Checking on (row, col) for now.
-            coords_floored = np.floor(coords).astype(int)  # floor the coordinates
-            if (coords_floored[0, 0], coords_floored[0, 1]) in prev_points:
-                continue
+            # This is the part that prevents using physical coordinates, since it pushes all points onto an integer grid.
+            if not is_physical_coordinates:
+                coords_floored = np.floor(coords).astype(int)  # floor the coordinates
+                if (coords_floored[0, 0], coords_floored[0, 1]) in prev_points:
+                    continue
+            else:
+                coords_floored = coords
 
             points = np.vstack((points, coords))
             prev_points.add((coords_floored[0, 0], coords_floored[0, 1]))

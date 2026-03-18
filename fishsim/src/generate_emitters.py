@@ -2,6 +2,8 @@ import math
 import numpy as np
 import time
 from typing import Tuple
+
+from tqdm import tqdm
 from .cells import EllipsoidCell
 from .ellipsoid import Ellipsoid
 
@@ -38,6 +40,7 @@ def cell_emitter_position(
     cell_count: int,
     cell_axes_bounds: dict,
     is_nucleus: bool,
+    is_physical_coordinates: bool = False
 ) -> Tuple[np.ndarray, list]:
     """Generates emitter positions taking cell structure into account
 
@@ -56,9 +59,11 @@ def cell_emitter_position(
     emitter_positions = np.empty(shape=(0, 3))
     total_volume = 0  # the total volume of all cells
 
+    pbar = tqdm(total=cell_count, desc="Generating cells")  # progress bar for cell generation
     # TODO: take out the cell creation portion of this code to a seperate function.
     while len(cells) < cell_count:
         # Generate center position for cells
+        #print("generating cell " + str(len(cells) + 1) + " out of " + str(cell_count))
         cell_pos = np.random.uniform(0, 1, size=(3,))
         cell_pos = cell_pos * np.array(
             [x_dim[1] - x_dim[0], y_dim[1] - y_dim[0], z_dim[1] - z_dim[0]]
@@ -70,15 +75,18 @@ def cell_emitter_position(
         for cell in cells:
             if Ellipsoid.check_overlap(current_cell.shape, cell.shape):
                 overlap = True  # if the new cells is overlapping with any of the newcell the flag will be set to True
+                #print("found overlapping cell, regenerating...")
                 break
 
         if overlap != True:  # If the new cell does not overlap with any old cells
             cells.append(current_cell)  # append the new cell to the list of the cells
             total_volume += current_cell.volume()
+        pbar.update(1)
+    pbar.close()
 
     total_emitter = 0
 
-    for i, cell in enumerate(cells):
+    for i, cell in tqdm(enumerate(cells), total=len(cells), desc="Generating emitters per cell"):
         if i == len(cells) - 1:  # throw all the remaining emitter into the last cell
             emitter_count = num_emitter - total_emitter
         else:
