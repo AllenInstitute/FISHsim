@@ -16,6 +16,11 @@ from scipy.ndimage import gaussian_filter, map_coordinates
 from pathlib import Path
 from scipy.ndimage import zoom
 import time
+import pandas as pd
+
+from multiprocessing import shared_memory
+from concurrent.futures import ProcessPoolExecutor
+import os
 
 import dask
 import dask.array as da
@@ -118,7 +123,7 @@ def _make_noise_sampler(grid_shape, noise_sigma_vox, seed):
         patch = np.empty((Pz, Py, Px), dtype=np.float32)
         for iz, z in enumerate(rz):
             gz = np.full((Py, Px), z, dtype=np.float32)
-            patch[iz] = map_coordinates(low, [gz, gy, gx], order=3, mode='nearest')
+            patch[iz] = map_coordinates(low, [gz, gy, gx], order=3, mode='constant')
         p_min, p_max = patch.min(), patch.max()
         if p_max > p_min:
             patch = (patch - p_min) / (p_max - p_min)
@@ -159,8 +164,8 @@ def _kde_patch(points_vox_zyx, patch_shape, kde_sigma_vox, lo_vox_zyx, downsampl
     ))
     density = np.real(ifftn(fftn(density) * kernel)).astype(np.float32)
 
-    if density.max() > 0:
-        density /= density.max()
+    '''if density.max() > 0:
+        density /= density.max()'''
 
     # upsample
     # instead of zoom:
@@ -171,11 +176,30 @@ def _kde_patch(points_vox_zyx, patch_shape, kde_sigma_vox, lo_vox_zyx, downsampl
     #out = zoom(density, zoom_factors, order=1, mode='nearest').astype(np.float32)
     return out
 
+
+def _feather_window(shape):
+    """
+    Smooth window that is 1 in the center and tapers to 0 at all edges.
+    Uses a sine taper over the outer 20% of each dimension.
+    """
+    windows = []
+    for n in shape:
+        w = np.ones(n, dtype=np.float32)
+        taper = max(1, int(n * 0.2))
+        ramp = np.sin(np.linspace(0, np.pi/2, taper))
+        w[:taper]  = ramp
+        w[-taper:] = ramp[::-1]
+        windows.append(w)
+    # Outer product across all dims
+    result = windows[0][:, None, None] * windows[1][None, :, None] * windows[2][None, None, :]
+    return result
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-'''
-def simulate_background_cells(
+
+
+'''def simulate_background_cells(
     cells,
     volume_shape,
     voxel_size,
@@ -185,7 +209,83 @@ def simulate_background_cells(
     padding=None,
     downsample=4,
     seed=42,
-    return_backgound: bool = False
+    return_background: bool = False
+    ):
+    """
+        Parameters
+        ----------
+        cells           : iterable of objects with .emitters (N,3) in (x,y,z) physical units
+        volume_shape    : [nz, ny, nx] in PIXELS
+        voxel_size      : [vz, vy, vx] physical units per pixel
+        noise_scale     : float, physical length scale of background variation
+        kde_bandwidth   : float or None  (default 3 × noise_scale)
+        noise_amplitude : float [0,1]
+        padding         : float or None, physical padding around cell bbox
+                        (default 2 × kde_bandwidth)
+        downsample      : int, downsampling factor for KDE blur (default 4)
+        seed            : int
+        return_background : bool, if True, also return the background array (default False), which is the noise modulated by the density. If False, only return the density.
+        Returns
+        -------
+        background : float32 ndarray, shape (nz, ny, nx)
+        density    : float32 ndarray, shape (nz, ny, nx)
+        """
+    voxel_size = list(voxel_size)
+    vz, vy, vx = _unpack(voxel_size)
+    if kde_bandwidth is None:
+        kde_bandwidth = 3.0 * noise_scale
+    if padding is None:
+        padding = 4.0 * kde_bandwidth
+    nz, ny, nx   = _grid_shape(volume_shape, voxel_size)
+    Lz, Ly, Lx   = _physical_extent(volume_shape, voxel_size)
+    grid_shape    = (nz, ny, nx)
+    noise_sv  = _noise_sigma_vox(noise_scale, voxel_size)
+    kde_sv    = _kde_sigma_vox(kde_bandwidth, voxel_size)
+    if return_background:
+        sample_noise = _make_noise_sampler(grid_shape, noise_sv, seed)
+        background = np.zeros(grid_shape, dtype=np.float32)
+    density = np.zeros((nz, ny, nx), dtype=np.float32)
+    for cell in tqdm(cells):
+        pts_vox = _emitters_to_vox(cell.emitters, voxel_size)
+        iz = np.clip(np.round(pts_vox[:,0]).astype(int), 0, nz-1)
+        iy = np.clip(np.round(pts_vox[:,1]).astype(int), 0, ny-1)
+        ix = np.clip(np.round(pts_vox[:,2]).astype(int), 0, nx-1)
+        np.add.at(density, (iz, iy, ix), 1.0)
+
+        density = gaussian_filter(density, sigma=kde_sv)
+        density = (density / density.max()).astype(np.float16)
+
+    if density.max() > 0:
+        density = (density / density.max()).astype(np.float16)
+
+    if return_background:
+        if background.max() > 0:
+            background = (background * noise_amplitude / background.max()).astype(np.float16)
+        return background, density
+    else:
+        return density
+
+def simulate_background(points, volume_shape, voxel_size, noise_scale,
+    kde_bandwidth=None, noise_amplitude=1.0, seed=42):
+    """Single point cloud wrapper. points in (x,y,z) physical units."""
+    class _Cell:
+        def __init__(self, pts): self.emitters = pts
+    return simulate_background_cells(
+            [_Cell(points)], volume_shape, voxel_size, noise_scale,
+    kde_bandwidth, noise_amplitude, seed=seed)
+'''
+
+'''def simulate_background_cells(
+    cells,
+    volume_shape,
+    voxel_size,
+    noise_scale,
+    kde_bandwidth=None,
+    noise_amplitude=1.0,
+    padding=None,
+    downsample=4,
+    seed=42,
+    return_background: bool = False
 ):
     """
     Parameters
@@ -222,7 +322,7 @@ def simulate_background_cells(
     noise_sv  = _noise_sigma_vox(noise_scale, voxel_size)
     kde_sv    = _kde_sigma_vox(kde_bandwidth, voxel_size)
 
-    if return_backgound:
+    if return_background:
         sample_noise = _make_noise_sampler(grid_shape, noise_sv, seed)
         background = np.zeros(grid_shape, dtype=np.float32)
     density    = np.zeros(grid_shape, dtype=np.float32)
@@ -252,14 +352,14 @@ def simulate_background_cells(
         lo_vox  = (iz0, iy0, ix0)
 
         dens_patch  = _kde_patch(pts_vox, patch_shape, kde_sv, lo_vox, downsample)
-        if return_backgound:
+        if return_background:
             noise_patch = sample_noise(iz0, iz1, iy0, iy1, ix0, ix1)
             background[iz0:iz1, iy0:iy1, ix0:ix1] += (noise_patch * dens_patch).astype(np.float32)
         density   [iz0:iz1, iy0:iy1, ix0:ix1] += dens_patch.astype(np.float32)
 
     if density.max() > 0:
         density = (density / density.max()).astype(np.float32)
-    if return_backgound:
+    if return_background:
         if background.max() > 0:
             background = (background * noise_amplitude / background.max()).astype(np.float32)
         return background, density
@@ -330,7 +430,7 @@ def simulate_background_cells(
     if kde_bandwidth is None:
         kde_bandwidth = 3.0 * noise_scale
     if padding is None:
-        padding = 4.0 * kde_bandwidth
+        padding = 6.0 * kde_bandwidth
 
     nz, ny, nx = _grid_shape(volume_shape, voxel_size)
     Lz, Ly, Lx = _physical_extent(volume_shape, voxel_size)
@@ -454,7 +554,394 @@ def simulate_background_cells(
     return (background_da, density_da) if return_background else density_da
 
 
+class _Cell:
+    def __init__(self, cell_df):
+        self.emitters = cell_df[["x", "y", "z"]]
 
+
+def simulate_density(cells, volume_shape, voxel_size, kde_bandwidth, downsample=4):
+    if isinstance(cells, pd.DataFrame):
+        g = cells.groupby("cell_id")
+        cells = []
+        for cell_id, cell_df in g:
+            cells.append(_Cell(cell_df))
+
+    voxel_size = list(voxel_size)
+    vz, vy, vx = _unpack(voxel_size)
+    nz, ny, nx = _grid_shape(volume_shape, voxel_size)
+
+    # Downsample the full volume for the blur
+    ds = downsample
+    low_shape = (max(4, int(np.ceil(nz / ds))),
+                 max(4, int(np.ceil(ny / ds))),
+                 max(4, int(np.ceil(nx / ds))))
+
+    density = np.zeros(low_shape, dtype=np.float32)
+
+    kde_sv = _kde_sigma_vox(kde_bandwidth, voxel_size)
+    sigma_low = tuple(s / ds for s in kde_sv)
+
+    for cell in cells:
+        n_emitters = cell.emitters.shape[0]
+        pts_xyz = np.asarray(cell.emitters, dtype=np.float32)
+        pts_vox = _emitters_to_vox(pts_xyz, voxel_size)
+        izs = np.clip(np.round(pts_vox[:, 0] / ds).astype(int), 0, low_shape[0]-1)
+        iys = np.clip(np.round(pts_vox[:, 1] / ds).astype(int), 0, low_shape[1]-1)
+        ixs = np.clip(np.round(pts_vox[:, 2] / ds).astype(int), 0, low_shape[2]-1)
+        np.add.at(density, (izs, iys, ixs), 1.0)
+
+    density = gaussian_filter(density, sigma=sigma_low)
+
+    # Upsample back to full resolution slice by slice
+    nz_l, ny_l, nx_l = low_shape
+    ry = np.linspace(0, ny_l-1, ny)
+    rx = np.linspace(0, nx_l-1, nx)
+    gy, gx = np.meshgrid(ry, rx, indexing='ij')
+    out = np.empty((nz, ny, nx), dtype=np.float32)
+    rz = np.linspace(0, nz_l-1, nz)
+    for iz, z in enumerate(rz):
+        gz = np.full((ny, nx), z, dtype=np.float32)
+        out[iz] = map_coordinates(density, [gz, gy, gx], order=1, mode='nearest')
+
+    total_emitters = sum(cell.emitters.shape[0] for cell in cells)
+    current_sum = float(out.sum())
+    if current_sum > 0:
+        out *= total_emitters / current_sum
+    '''voxel_volume = voxel_size[0]*voxel_size[1]*voxel_size[2]
+    out = out / voxel_volume'''
+    '''if out.max() > 0:
+        out /= out.max()'''
+    return out.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Vectorised surface generation (replaces the double Python loop)
+# ---------------------------------------------------------------------------
+ 
+def generate_surface_vectorised(ellipsoid, n: int = 200) -> np.ndarray:
+    """Vectorised drop-in replacement for Ellipsoid.generate__surface().
+ 
+    Eliminates the 200x200 Python loop by computing all rotations and
+    translations with a single batched matrix multiply.
+ 
+    Parameters
+    ----------
+    ellipsoid : Ellipsoid
+        Must have .axes, .center, and .R.
+    n : int
+        Grid resolution (default 200, matching the original method).
+ 
+    Returns
+    -------
+    np.ndarray, shape (n*n, 3)
+        Surface points in world coordinates.
+    """
+    theta = np.linspace(0, 2 * np.pi, n)
+    phi   = np.arccos(1 - 2 * np.linspace(0, 1, n))
+    T, P  = np.meshgrid(theta, phi)           # T=theta, P=phi, each (n, n)
+ 
+    # Correct spherical parameterisation:
+    #   x = a * sin(phi) * cos(theta)
+    #   y = b * sin(phi) * sin(theta)
+    #   z = c * cos(phi)
+    x = (ellipsoid.axes[0] * np.sin(P) * np.cos(T)).ravel()
+    y = (ellipsoid.axes[1] * np.sin(P) * np.sin(T)).ravel()
+    z = (ellipsoid.axes[2] * np.cos(P)).ravel()
+ 
+    pts = np.stack([x, y, z], axis=0)         # (3, N)
+    return (ellipsoid.R @ pts).T + ellipsoid.center  # (N, 3) world coords
+ 
+ 
+# ---------------------------------------------------------------------------
+# Core per-ellipsoid mask computation (no shared state, safe to pickle)
+# ---------------------------------------------------------------------------
+ 
+def _compute_masks(ellipsoid, voxel_size: np.ndarray):
+    """Return (origin, filled_mask, surface_mask) for one ellipsoid.
+ 
+    Coordinate conventions
+    ----------------------
+    - Ellipsoid attributes (axes, center, R) are in (x, y, z) world order.
+    - voxel_size and the output array are in (z, y, x) order.
+    - The conversion happens here and nowhere else: we reverse the world-space
+      quantities to (z, y, x) before doing any voxel-index arithmetic.
+    """
+    # half_extents_world: R row i gives the world-axis-i components of the
+    # rotated ellipsoid. Rows are (x, y, z), so reverse to get (z, y, x).
+    half_extents_world_xyz = np.sqrt(np.sum((ellipsoid.R * ellipsoid.axes) ** 2, axis=1))
+    half_extents_world_zyx = half_extents_world_xyz[::-1]          # (z, y, x)
+    half_extents = half_extents_world_zyx / voxel_size             # voxel units, (z,y,x)
+ 
+    # center is (cx, cy, cz) — reverse to (cz, cy, cx) before dividing by voxel_size
+    center_zyx = ellipsoid.center[::-1]
+    origin = np.round(center_zyx / voxel_size - half_extents).astype(int)
+    bbox_size = np.ceil(2 * half_extents).astype(int) + 1
+    dz, dy, dx = bbox_size
+ 
+    # Filled mask: build voxel grid, convert offsets back to world coords (x,y,z)
+    # for the ellipsoid distance test, then reshape.
+    gz, gy, gx = np.mgrid[0:dz, 0:dy, 0:dx]
+    # World-space offsets from ellipsoid centre, keeping (x, y, z) order for R
+    wx = (gx - half_extents[2]) * voxel_size[2]   # x = array axis 2
+    wy = (gy - half_extents[1]) * voxel_size[1]   # y = array axis 1
+    wz = (gz - half_extents[0]) * voxel_size[0]   # z = array axis 0
+    pts_xyz = np.stack([wx.ravel(), wy.ravel(), wz.ravel()], axis=1)  # (N, 3) in xyz
+    pts_local = pts_xyz @ ellipsoid.R
+    dist2 = np.sum((pts_local / ellipsoid.axes) ** 2, axis=1)
+    filled_mask = (dist2 <= 1.0).reshape(dz, dy, dx)
+ 
+    # Surface mask: points come out of generate_surface_vectorised in (x, y, z).
+    # Reverse each point to (z, y, x) before computing local voxel indices.
+    surface_pts_xyz = generate_surface_vectorised(ellipsoid)          # (N, 3) xyz
+    surface_pts_zyx = surface_pts_xyz[:, ::-1]                        # (N, 3) zyx
+    bbox_corner_zyx = center_zyx - half_extents_world_zyx
+    local_idx = np.round((surface_pts_zyx - bbox_corner_zyx) / voxel_size).astype(int)
+    valid = (
+        (local_idx[:, 0] >= 0) & (local_idx[:, 0] < dz)
+        & (local_idx[:, 1] >= 0) & (local_idx[:, 1] < dy)
+        & (local_idx[:, 2] >= 0) & (local_idx[:, 2] < dx)
+    )
+    idx = local_idx[valid]
+    surface_mask = np.zeros((dz, dy, dx), dtype=bool)
+    surface_mask[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+ 
+    return origin, filled_mask, surface_mask
+ 
+ 
+def _write_masks(target, origin, filled_mask, surface_mask, filled_value, surface_value):
+    """Write pre-computed masks into target at origin, clipping to bounds."""
+    tz, ty, tx = target.shape
+    dz, dy, dx = filled_mask.shape
+    z0, y0, x0 = origin
+ 
+    src_z0 = max(0, -z0);  src_z1 = min(dz, tz - z0)
+    src_y0 = max(0, -y0);  src_y1 = min(dy, ty - y0)
+    src_x0 = max(0, -x0);  src_x1 = min(dx, tx - x0)
+ 
+    dst_z0 = max(0, z0);   dst_z1 = dst_z0 + (src_z1 - src_z0)
+    dst_y0 = max(0, y0);   dst_y1 = dst_y0 + (src_y1 - src_y0)
+    dst_x0 = max(0, x0);   dst_x1 = dst_x0 + (src_x1 - src_x0)
+ 
+    if not (src_z1 > src_z0 and src_y1 > src_y0 and src_x1 > src_x0):
+        return  # ellipsoid entirely outside target
+ 
+    src_s = (slice(src_z0, src_z1), slice(src_y0, src_y1), slice(src_x0, src_x1))
+    dst_s = (slice(dst_z0, dst_z1), slice(dst_y0, dst_y1), slice(dst_x0, dst_x1))
+ 
+    target[dst_s][filled_mask[src_s]]  = filled_value
+    target[dst_s][surface_mask[src_s]] = surface_value
+ 
+ 
+# ---------------------------------------------------------------------------
+# Shared-memory worker: compute masks then write directly into shared array
+# ---------------------------------------------------------------------------
+ 
+def _worker(args):
+    """Compute masks for one ellipsoid and write into the shared volume.
+ 
+    Parameters are passed as a single tuple so ProcessPoolExecutor can
+    pickle them.
+    """
+    (ellipsoid, voxel_size,
+     shm_name, shape, dtype,
+     filled_value, surface_value) = args
+ 
+    voxel_size = np.asarray(voxel_size)
+    origin, filled_mask, surface_mask = _compute_masks(ellipsoid, voxel_size)
+ 
+    # Attach to the shared memory block — no copy of the full volume
+    shm = shared_memory.SharedMemory(name=shm_name)
+    target = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+ 
+    # Non-overlapping ellipsoids: no locking needed.
+    # If you have overlapping ellipsoids, wrap _write_masks in a Lock.
+    _write_masks(target, origin, filled_mask, surface_mask, filled_value, surface_value)
+ 
+    shm.close()
+ 
+ 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+ 
+def insert_ellipsoid_mask(
+    ellipsoid,
+    target: np.ndarray,
+    voxel_size: float | tuple,
+    filled_value: int = 1,
+    surface_value: int = 2,
+) -> np.ndarray:
+    """Insert a single voxelised ellipsoid mask into target (in-place).
+ 
+    For inserting many ellipsoids, use insert_all_ellipsoid_masks which
+    parallelises across CPU cores via shared memory.
+ 
+    Parameters
+    ----------
+    ellipsoid : Ellipsoid
+        Instance with .axes, .center, .R.
+    target : np.ndarray, shape (Z, Y, X)
+        Destination volume, modified in-place.
+    voxel_size : float or (sz, sy, sx)
+        Physical size of one voxel in world-coordinate units.
+    filled_value : int
+        Value for interior voxels (default 1).
+    surface_value : int
+        Value for surface voxels, written over filled (default 2).
+ 
+    Returns
+    -------
+    np.ndarray — target, modified in-place.
+    """
+    voxel_size = np.broadcast_to(np.asarray(voxel_size, dtype=float), (3,)).copy()
+    origin, filled_mask, surface_mask = _compute_masks(ellipsoid, voxel_size)
+    _write_masks(target, origin, filled_mask, surface_mask, filled_value, surface_value)
+    return target
+ 
+ 
+def insert_all_ellipsoid_masks(
+    ellipsoids: list,
+    target: np.ndarray,
+    voxel_size,
+    filled_values=1,
+    surface_values=2,
+    max_workers: int = None,
+) -> np.ndarray:
+    """Insert all ellipsoids into target in parallel using shared memory.
+ 
+    Each worker process computes the bounding-box masks for one ellipsoid and
+    writes them directly into a shared memory block. The large volume array is
+    never copied between processes.
+ 
+    Parameters
+    ----------
+    ellipsoids : list of Ellipsoid
+    target : np.ndarray, shape (Z, Y, X)
+        Modified in-place. Must be a C-contiguous array.
+    voxel_size : float or (sz, sy, sx)
+    filled_values : int or list of int
+        Value(s) written for interior voxels. Pass a single int to use the same
+        value for all ellipsoids, or a list of len(ellipsoids) to assign a
+        unique label per cell — e.g. list(range(1, len(ellipsoids) + 1)).
+    surface_values : int or list of int
+        Same as filled_values but for surface voxels (written over filled).
+    max_workers : int, optional
+        Number of worker processes. Defaults to os.cpu_count().
+ 
+    Returns
+    -------
+    np.ndarray — target, modified in-place.
+ 
+    Notes
+    -----
+    Assumes ellipsoids are non-overlapping. If two ellipsoids share voxels,
+    whichever worker finishes last wins — results are non-deterministic in the
+    overlap region. For overlapping cases, use insert_ellipsoid_mask in a
+    serial loop instead.
+    """
+    if not target.data.c_contiguous:
+        raise ValueError(
+            "target must be C-contiguous. Call np.ascontiguousarray(target) first."
+        )
+ 
+    n = len(ellipsoids)
+    fv = filled_values  if isinstance(filled_values,  list) else [filled_values]  * n
+    sv = surface_values if isinstance(surface_values, list) else [surface_values] * n
+    if len(fv) != n or len(sv) != n:
+        raise ValueError(
+            "filled_values and surface_values must each have one entry per ellipsoid."
+        )
+ 
+    voxel_size_arr = np.broadcast_to(np.asarray(voxel_size, dtype=float), (3,)).copy()
+ 
+    # Place the volume in shared memory — workers attach by name, no copy per worker
+    shm = shared_memory.SharedMemory(create=True, size=target.nbytes)
+    shared_arr = np.ndarray(target.shape, dtype=target.dtype, buffer=shm.buf)
+    shared_arr[:] = target  # copy initial state (usually all zeros)
+ 
+    worker_args = [
+        (e, voxel_size_arr.tolist(), shm.name, target.shape, target.dtype, f, s)
+        for e, f, s in zip(ellipsoids, fv, sv)
+    ]
+ 
+    try:
+        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(_worker, worker_args))  # consume iterator to surface exceptions
+        target[:] = shared_arr  # write results back into the caller's array
+    finally:
+        shm.close()
+        shm.unlink()
+ 
+    return target
+    
+        
+'''
+import open3d as o3d
+from skimage.draw import ellipsoid
+from skimage.measure import marching_cubes, mesh_to_volume
+
+
+def generate_mask_from_points(points, volume_shape):
+    """
+    Generates a 3D binary mask from a list of surface points.
+
+    Args:
+        points (np.ndarray): A (N, 3) array of surface points.
+        volume_shape (tuple): The desired shape of the output 3D mask (e.g., (100, 100, 100)).
+
+    Returns:
+        np.ndarray: A 3D binary mask (numpy array).
+    """
+    # 1. Convert numpy points to Open3D point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    
+    # Optional: Estimate normals for better mesh reconstruction
+    pcd.estimate_normals()
+    
+    # 2. Reconstruct a closed surface mesh (e.g., using Ball Pivoting algorithm)
+    # The radii parameter is crucial and depends on the density of your points
+    radii = [0.005, 0.01, 0.02, 0.04] # Adjust radii based on your data scale
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+        pcd, o3d.utility.DoubleVector(radii)
+    )
+    
+    # Ensure the mesh is oriented consistently (watertight is best)
+    mesh.orient_triangles()
+
+    # 3. Convert the mesh to a binary volume (mask) using skimage
+    # Adjust the level_set value to define the interior (e.g., 0.5)
+    # The output mask will have the specified volume_shape
+    mask = mesh_to_volume(
+        vertices=np.asarray(mesh.vertices), 
+        faces=np.asarray(mesh.triangles), 
+        volume_shape=volume_shape
+    ).astype(bool)
+
+    return mask
+
+'''
+"""
+# --- Example Usage ---
+# 1. Generate sample surface points (e.g., points on an ellipsoid)
+# Create a sample ellipsoid volume first to get ground truth points
+vol_shape = (100, 100, 100)
+# create_surface expects a function for the surface values, this is an example
+verts, faces, _, _ = marching_cubes(ellipsoid(60, 60, 35, levelset=True), level=0)
+
+# Shift vertices so they are centered around the origin (adjust if your points are not centered)
+center_shift = np.array(vol_shape) / 2.
+points = verts - center_shift
+
+# 2. Generate the mask
+binary_mask = generate_mask_from_points(points, vol_shape)
+
+# 3. Visualize a slice of the result
+plt.imshow(binary_mask[:, :, vol_shape[2] // 2], cmap='gray')
+plt.title(f"Center slice of generated mask (shape: {binary_mask.shape})")
+plt.axis('off')
+plt.show()
+"""
 
 # ---------------------------------------------------------------------------
 # Demo

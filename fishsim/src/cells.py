@@ -49,7 +49,7 @@ class EllipsoidCell(Cell):
         )
 
     def generate_emitters(
-        self, num_emitters: int, boundary_box_dim: list = None, is_nucleus: bool = False, is_physical_coordinates: bool = False
+        self, num_emitters: int, boundary_box_dim: list = None, is_nucleus: bool = False, is_physical_coordinates: bool = True
     ) -> None:
         """Randomly generates the specified number of emitters within the volume of the cell
 

@@ -40,7 +40,8 @@ def cell_emitter_position(
     cell_count: int,
     cell_axes_bounds: dict,
     is_nucleus: bool,
-    is_physical_coordinates: bool = False
+    is_physical_coordinates: bool = False,
+    emitter_per_cell: bool = True,
 ) -> Tuple[np.ndarray, list]:
     """Generates emitter positions taking cell structure into account
 
@@ -86,18 +87,26 @@ def cell_emitter_position(
 
     total_emitter = 0
 
-    for i, cell in tqdm(enumerate(cells), total=len(cells), desc="Generating emitters per cell"):
-        if i == len(cells) - 1:  # throw all the remaining emitter into the last cell
-            emitter_count = num_emitter - total_emitter
-        else:
-            emitter_count = math.floor((num_emitter / total_volume) * cell.volume())
-            total_emitter += emitter_count
+    if emitter_per_cell:
+        for i, cell in tqdm(enumerate(cells), total=len(cells), desc=f"Generating {num_emitter} emitters per cell"):
+            cell.generate_emitters(
+                num_emitter, np.array([x_dim, y_dim, z_dim]), is_nucleus=True
+            )
+            emitter_positions = np.vstack((emitter_positions, cell.emitters))
 
-        # NOTE: that xyz dim bounds aren't applied here. Could be added in the future
-        cell.generate_emitters(
-            emitter_count, np.array([x_dim, y_dim, z_dim]), is_nucleus
-        )
-        emitter_positions = np.vstack((emitter_positions, cell.emitters))
+    else:
+        for i, cell in tqdm(enumerate(cells), total=len(cells), desc="Generating emitters per cell"):
+            if i == len(cells) - 1:  # throw all the remaining emitter into the last cell
+                emitter_count = num_emitter - total_emitter
+            else:
+                emitter_count = math.floor((num_emitter / total_volume) * cell.volume())
+                total_emitter += emitter_count
+
+            # NOTE: that xyz dim bounds aren't applied here. Could be added in the future
+            cell.generate_emitters(
+                emitter_count, np.array([x_dim, y_dim, z_dim]), is_nucleus
+            )
+            emitter_positions = np.vstack((emitter_positions, cell.emitters))
 
     return emitter_positions, cells
 

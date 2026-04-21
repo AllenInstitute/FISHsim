@@ -59,7 +59,7 @@ class Ellipsoid:
         return inv_M.T @ A @ inv_M
 
     def random_point(
-        self, radial_extent: list, num_points: int = 1, boundary_box_dim: list = None, is_physical_coordinates: bool = False
+        self, radial_extent: list, num_points: int = 1, boundary_box_dim: list = None, is_physical_coordinates: bool = True
     ) -> np.ndarray:
         """Generates a random point within the volume of the nucleus.
             One can specify which section of the nucleus to sample from by specifying radial extent
