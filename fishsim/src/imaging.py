@@ -11,6 +11,8 @@ Signal chain:
 import numpy as np
 import dask.array as da
 from numpy.typing import ArrayLike
+import json
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -119,19 +121,39 @@ class CameraSimulator:
 
     def __init__(
         self,
-        QE: dict,
-        gain: float,
-        bias: float,
-        dark_current: float,
-        read_noise: float,
-        well_depth: int,
+        spec_file: Path | None = None,
+        qe_file: Path | None = None,
+        mode: str | None = None,
+        QE: dict | None = None,
+        gain: float | None = None,
+        bias: float | None = None,
+        dark_current: float | None = None,
+        read_noise: float | None = None,
+        well_depth: int | None = None,
     ):
-        self.QE = QE
-        self.gain = gain
-        self.bias = bias
-        self.dark_current = dark_current
-        self.read_noise = read_noise
-        self.well_depth = well_depth
+        if spec_file and mode:
+            with open(spec_file, 'r') as f:
+                specs = json.load(f)
+            self.gain = specs.get("conversion_factor", {}).get(mode)
+            self.bias = specs.get("dark_offset", {}).get(mode)
+            self.dark_current = specs.get("dark_current", {}).get(mode)
+            self.read_noise = specs.get("read_noise", {}).get(mode)
+            self.well_depth = specs.get("full_well_capacity", {}).get(mode)
+        else:
+            self.gain = gain
+            self.bias = bias
+            self.dark_current = dark_current
+            self.read_noise = read_noise
+            self.well_depth = well_depth
+        if qe_file and mode:
+            with open(qe_file, 'r') as f:
+                self.QE = {
+                    int(line.split(",")[0]): float(line.split(",")[1].strip())
+                    for line in f.readlines()[1:]
+                }
+        else:
+            self.QE = QE
+
 
     def simulate_image(
         self,
@@ -149,7 +171,7 @@ class CameraSimulator:
         Returns:
             uint16 digital count image
         """
-        qe = self.QE.get(wavelength, 1.0)
+        qe = self.QE.get(round(wavelength), self.QE.get(wavelength, 1.0))
 
         # 1. Shot noise
         photon_noisy = np.random.poisson(photon_image.astype(np.float64))

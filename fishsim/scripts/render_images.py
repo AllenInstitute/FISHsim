@@ -137,6 +137,29 @@ def parse_args():
             "from cells.csv is prepended as channel 0 of every imaging round."
         ),
     )
+    # Camera configuration (file-based takes priority over defaults)
+    p.add_argument(
+        "--camera-spec-file", default=None, metavar="JSON",
+        help=(
+            "Path to a camera spec JSON file containing conversion_factor, "
+            "dark_offset, dark_current, read_noise, and full_well_capacity "
+            "keyed by readout mode. Requires --camera-mode."
+        ),
+    )
+    p.add_argument(
+        "--camera-qe-file", default=None, metavar="CSV",
+        help=(
+            "Path to a two-column CSV (Wavelength, QE) for the camera's "
+            "quantum efficiency curve. Requires --camera-mode."
+        ),
+    )
+    p.add_argument(
+        "--camera-mode", default=None, metavar="MODE",
+        help=(
+            "Readout mode name to select from --camera-spec-file and "
+            "--camera-qe-file (e.g. 'dynamic_range', 'sensitivity')."
+        ),
+    )
     return p.parse_args()
 
 
@@ -391,16 +414,25 @@ def main():
 
     exposure_s = args.exposure_ms * k.milli * args.brightness_scale
 
-    # Build a shared camera whose QE covers all dye wavelengths
-    qe_map = {wl: 0.85 for _, wl in dye_channels}  # placeholder; override per-dye if needed
-    camera = CameraSimulator(
-        QE=qe_map,
-        gain=1.0 / 0.25,
-        bias=100,
-        dark_current=1.0,
-        read_noise=1.8,
-        well_depth=15000,
-    )
+    # Build a shared camera.  File-based config takes priority; scalar defaults
+    # are used as fallback when no spec/QE file is supplied.
+    use_files = args.camera_spec_file and args.camera_mode
+    if use_files:
+        camera = CameraSimulator(
+            spec_file=Path(args.camera_spec_file),
+            qe_file=Path(args.camera_qe_file) if args.camera_qe_file else None,
+            mode=args.camera_mode,
+        )
+    else:
+        qe_map = {wl: 0.85 for _, wl in dye_channels}  # placeholder QE
+        camera = CameraSimulator(
+            QE=qe_map,
+            gain=1.0 / 0.25,
+            bias=100,
+            dark_current=1.0,
+            read_noise=1.8,
+            well_depth=15000,
+        )
 
     gt_paths = _find_groundtruth_paths(scene_dir)
     if not gt_paths:

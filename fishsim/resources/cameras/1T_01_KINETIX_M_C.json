@@ -1,0 +1,43 @@
+{
+    "pixel_size_um": 6.5,
+    "sensor_size_pix": [3200,3200],
+    "modes": ["dynamic_range", "speed", "sensitivity", "sub-electron"],
+    "read_noise": {
+        "units": "e_rms",
+        "dynamic_range": 1.6,
+        "speed": 2.0,
+        "sensitivity": 1.2,
+        "sub-electron": 0.7
+    },
+    "quantum_efficiency": {
+        "550nm": 0.95
+    },
+    "full_well_capacity": {
+        "units": "e",
+        "dynamic_range": 15000,
+        "speed": 200,
+        "sensitivity": 1000,
+        "sub-electron": 1000
+    },
+    "conversion_factor": {
+        "unit": "e/count",
+        "dynamic_range": 0.23,
+        "speed": 0.85,
+        "sensitivity": 0.25,
+        "sub-electron": 0.015
+    },
+    "dark_current": {
+        "unit": "e/pixel/s",
+        "dynamic_range": 1.27,
+        "speed": 3.0,
+        "sensitivity": 1.03,
+        "sub-electron": 0.477
+    },
+    "dark_offset": {
+        "unit": "count",
+        "dynamic_range": 100,
+        "speed": 20,
+        "sensitivity": 100,
+        "sub-electron": 1000
+    }
+}
