@@ -42,7 +42,13 @@ Usage:
         --output-dir results/images_01
 """
 
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import argparse
+import datetime
 import json
 import numpy as np
 import pandas as pd
@@ -53,6 +59,7 @@ from dask.diagnostics import ProgressBar
 
 from fishsim.src import sim3d
 from fishsim.src.imaging import CameraSimulator, DyeSimulator, CY3, CY5, AF750
+from fishsim.src.point_cloud_background import simulate_autofluorescence
 
 
 # Registry of named dye instances available from the CLI.
@@ -136,6 +143,30 @@ def parse_args():
             "Omit the fake DAPI channel.  By default a nuclear mask derived "
             "from cells.csv is prepended as channel 0 of every imaging round."
         ),
+    )
+    # Autofluorescence
+    p.add_argument(
+        "--autofluorescence-rate", type=float, default=0.0,
+        metavar="PHOTONS_PER_VOXEL_PER_S",
+        help=(
+            "Mean autofluorescence photon rate per interior voxel per second. "
+            "Applied uniformly to all dye channels. 0 disables (default: 0)"
+        ),
+    )
+    p.add_argument(
+        "--af-cv", type=float, default=0.3,
+        metavar="CV",
+        help="Cell-to-cell coefficient of variation for autofluorescence intensity (default: 0.3)",
+    )
+    p.add_argument(
+        "--af-smooth-um", type=float, default=2.0,
+        metavar="UM",
+        help="Spatial length scale of within-cell autofluorescence texture in µm (default: 2.0)",
+    )
+    p.add_argument(
+        "--round", type=int, default=None,
+        metavar="N",
+        help="Render only imaging round N (1-based). Omit to render all rounds.",
     )
     # Camera configuration (file-based takes priority over defaults)
     p.add_argument(
@@ -269,6 +300,7 @@ def _render_channel(
     camera: CameraSimulator,
     exposure_s: float,
     num_workers: int,
+    autofluorescence_im: np.ndarray | None = None,
 ) -> np.ndarray:
     """Render one dye channel for a given set of bit positions.
 
@@ -282,16 +314,23 @@ def _render_channel(
     channel_df = df[on_mask]
 
     if channel_df.empty:
-        return np.zeros(volume_shape, dtype=np.uint16)
+        photon_im = np.zeros(volume_shape, dtype=np.float32)
+    else:
+        tile_im_dask = sim3d.build_tile_point_im(
+            channel_df, FZ, FR, FC, psf_fft, psf_crop_slices, psf,
+            volume_shape=volume_shape,
+            block_shape=block_shape,
+        )
+        import time
+        photon_im_dask = dye.psf_to_photon_distribution(tile_im_dask.clip(min=0), exposure_s)
+        t0 = time.perf_counter()
+        with ProgressBar():
+            photon_im = photon_im_dask.compute(num_workers=num_workers)
+        print(f"  compute() wall time: {time.perf_counter() - t0:.1f}s  "
+              f"({len(channel_df)} spots, {num_workers} workers)")
 
-    tile_im_dask = sim3d.build_tile_point_im(
-        channel_df, FZ, FR, FC, psf_fft, psf_crop_slices, psf,
-        volume_shape=volume_shape,
-        block_shape=block_shape,
-    )
-    photon_im = dye.psf_to_photon_distribution(tile_im_dask.clip(min=0), exposure_s)
-    with ProgressBar():
-        photon_im = photon_im.compute(num_workers=num_workers)
+    if autofluorescence_im is not None:
+        photon_im = photon_im + autofluorescence_im
 
     return camera.simulate_image(photon_im, wavelength, exposure_s)
 
@@ -365,6 +404,50 @@ def _make_dapi_channel(
     return dapi.clip(0, 65535).astype(np.uint16)
 
 
+def _write_render_params(
+    output_dir: Path,
+    args,
+    camera: CameraSimulator,
+    dye_channels: list,
+    exposure_s: float,
+    volume_shape: list,
+    n_bits: int,
+    n_rounds: int,
+) -> None:
+    """Write a JSON record of all parameters used in this render run."""
+    record = {
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "args": vars(args),
+        "derived": {
+            "exposure_s": exposure_s,
+            "volume_shape_voxels": volume_shape,
+            "n_bits": n_bits,
+            "n_rounds": n_rounds,
+            "dye_channels": [
+                {"name": name, "wavelength_nm": wl}
+                for name, (_, wl) in zip(args.dyes, dye_channels)
+            ],
+        },
+        "camera": {
+            "gain": camera.gain,
+            "bias": camera.bias,
+            "dark_current": camera.dark_current,
+            "read_noise": camera.read_noise,
+            "well_depth": camera.well_depth,
+        },
+    }
+
+    def _default(obj):
+        if isinstance(obj, Path):
+            return str(obj)
+        raise TypeError(f"Object of type {type(obj)} is not JSON serialisable")
+
+    out_path = output_dir / "render_params.json"
+    with open(out_path, "w") as f:
+        json.dump(record, f, indent=2, default=_default)
+    print(f"Run parameters saved to {out_path}")
+
+
 def main():
     args = parse_args()
 
@@ -434,20 +517,45 @@ def main():
             well_depth=15000,
         )
 
+    _write_render_params(
+        output_dir, args, camera, dye_channels,
+        exposure_s, volume_shape, n_bits, n_rounds,
+    )
+
     gt_paths = _find_groundtruth_paths(scene_dir)
     if not gt_paths:
         raise FileNotFoundError(f"No groundtruth CSV files found under {scene_dir}")
 
     # Generate fake DAPI channel from cell geometry (same for all tiles/rounds).
+    cells_csv = scene_dir / "cells.csv"
+    cells_df = pd.read_csv(cells_csv) if cells_csv.exists() else None
+
     dapi_im = None
     if not args.no_dapi:
-        cells_csv = scene_dir / "cells.csv"
-        if cells_csv.exists():
-            cells_df = pd.read_csv(cells_csv)
+        if cells_df is not None:
             print(f"Generating fake DAPI channel from {len(cells_df)} cells...")
             dapi_im = _make_dapi_channel(cells_df, volume_shape, pixel_size)
         else:
             print(f"Warning: cells.csv not found at {cells_csv}; skipping DAPI channel.")
+
+    # Autofluorescence — computed once, reused for every round and channel.
+    autofluorescence_im = None
+    if args.autofluorescence_rate > 0:
+        if cells_df is not None:
+            print(
+                f"Generating autofluorescence (rate={args.autofluorescence_rate} ph/vox/s, "
+                f"CV={args.af_cv}, smooth={args.af_smooth_um} µm)..."
+            )
+            autofluorescence_im = simulate_autofluorescence(
+                cells_df,
+                volume_shape=volume_shape,
+                pixel_size=pixel_size,
+                mean_photons=args.autofluorescence_rate * exposure_s,
+                cv=args.af_cv,
+                smooth_scale_um=args.af_smooth_um,
+            )
+        else:
+            print("Warning: cells.csv not found; skipping autofluorescence.")
 
     n_channels_total = n_dyes + (1 if dapi_im is not None else 0)
 
@@ -461,7 +569,16 @@ def main():
             )
         )
 
-        for round_num in range(n_rounds):
+        rounds_to_render = (
+            [args.round - 1] if args.round is not None else range(n_rounds)
+        )
+        if args.round is not None:
+            if args.round < 1 or args.round > n_rounds:
+                raise ValueError(
+                    f"--round {args.round} is out of range (1–{n_rounds})"
+                )
+
+        for round_num in rounds_to_render:
             # Bit positions (0-based) for this round, grouped by dye index
             round_start = round_num * n_dyes
             bits_per_dye = [
@@ -483,16 +600,20 @@ def main():
                     FZ, FR, FC, psf_fft, psf_crop_slices, psf,
                     volume_shape, tuple(args.block_shape),
                     dye, wavelength, camera, exposure_s, args.num_workers,
+                    autofluorescence_im=autofluorescence_im,
                 )
                 channel_images.append(img)  # each is (n_z, n_y, n_x)
 
             # Stack into (n_z * n_channels_total, n_y, n_x), channels cycling within each z-plane.
-            # DAPI is channel 0 when present:
-            #   [dapi_z0, ch0_z0, ch1_z0, dapi_z1, ch0_z1, ch1_z1, ...]
-            all_channels = ([dapi_im] if dapi_im is not None else []) + channel_images
+            # DAPI is the last channel when present:
+            #   [ch0_z0, ch1_z0, dapi_z0, ch0_z1, ch1_z1, dapi_z1, ...]
+            # A single blank throwaway frame is prepended at index 0.
+            all_channels = channel_images + ([dapi_im] if dapi_im is not None else [])
             stacked = np.stack(all_channels, axis=1)   # (n_z, n_channels_total, n_y, n_x)
             n_y, n_x = stacked.shape[2], stacked.shape[3]
             stacked = stacked.reshape(n_z * n_channels_total, n_y, n_x)
+            throwaway = np.zeros((1, n_y, n_x), dtype=np.uint16)
+            stacked = np.concatenate([throwaway, stacked], axis=0)
 
             fov_str = f"{tile_idx:03d}"  # zero-based to match real data (000, 001, ...)
 
@@ -519,7 +640,7 @@ def main():
             xml = _make_xml(
                 stage_x=tile_idx * volume_um[2],
                 stage_y=0.0,
-                n_frames=n_z * n_channels_total,
+                n_frames=1 + n_z * n_channels_total,
                 z_start=0.0,
                 z_stop=-(n_z * dz),
                 z_step=-dz,
@@ -529,7 +650,7 @@ def main():
             xml_path.write_text(xml, encoding="ISO-8859-1")
 
             print(f"  Saved {fov_path / 'data'}  shape={stacked.shape}  "
-                  f"[{n_z} z-planes x {n_channels_total} channels]")
+                  f"[1 throwaway + {n_z} z-planes x {n_channels_total} channels]")
 
     print(f"\nRendering complete. Output in {output_dir}")
     print(f"Hyb folder pattern: H{{round}}_{args.tag}_set{args.set_num}/"
