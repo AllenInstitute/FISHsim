@@ -1,0 +1,36 @@
+# generate_scene.py configuration
+# Run with: python -m fishsim.scripts.generate_scene --config fishsim/resources/configs/scene_example.yml
+#
+# All paths are relative to the working directory (project root).
+# Command-line arguments override any value set here.
+
+# Required paths
+codebook: fishsim/resources/codebooks/BRBB_500Markergn.csv
+output_dir: Z:\MERFISHp\smaller_generated_sim
+
+# Imaging volume in µm [z, y, x].
+# Cell count is derived automatically from the volume and cell_radius.
+volume: [16.0, 100.0, 100.0]
+
+# Cell half-axis [min, max] in µm. All three principal axes use the same range.
+cell_radius: [7.0, 9.0]
+
+# Fraction of the volume treated as occupied when estimating cell count.
+# ~0.64 is the theoretical random close-packing limit for spheres; 0.55 is
+# conservative to account for rejection-sampling overhead.
+packing_fraction: 0.55
+
+# Number of fluorescent emitters placed inside each cell.
+emitters_per_cell: 300
+
+# Barcode error rates (0–1).
+# bit_drop: probability that a '1' bit is silenced (fluorophore dropout).
+# bit_add:  probability that a '0' bit is spuriously lit (non-specific binding).
+bit_drop: 0.05
+bit_add: 0.05
+
+# Number of independent tiles to generate.
+tiles: 1
+
+# Random seed for reproducibility. Leave as null for a random run.
+seed: null
