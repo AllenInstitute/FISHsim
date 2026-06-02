@@ -409,17 +409,17 @@ def build_tile_point_im(
                     slice(c, min(c + block_shape[2], volume_shape[2])),
                 )
                 blocks.append(slices)
-                d = delayed(_process_block)(
-                    slices, points_arrays, FZ, FR, FC,
-                    psf_fft, psf_crop_slices, psf, volume_shape,
-                )
-                dask_blocks.append(
-                    da.from_delayed(
-                        d,
-                        shape=tuple(s.stop - s.start for s in slices),
-                        dtype=np.float32,
+                block_shape_actual = tuple(s.stop - s.start for s in slices)
+                if len(_points_overlapping_block(points_arrays, slices, psf.shape)["frame"]) == 0:
+                    dask_blocks.append(da.zeros(block_shape_actual, dtype=np.float32))
+                else:
+                    d = delayed(_process_block)(
+                        slices, points_arrays, FZ, FR, FC,
+                        psf_fft, psf_crop_slices, psf, volume_shape,
                     )
-                )
+                    dask_blocks.append(
+                        da.from_delayed(d, shape=block_shape_actual, dtype=np.float32)
+                    )
 
     n_z = len(range(0, volume_shape[0], block_shape[0]))
     n_r = len(range(0, volume_shape[1], block_shape[1]))
