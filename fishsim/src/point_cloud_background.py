@@ -944,6 +944,120 @@ plt.show()
 """
 
 # ---------------------------------------------------------------------------
+# Autofluorescence simulation
+# ---------------------------------------------------------------------------
+
+def simulate_autofluorescence(
+    cells_df: pd.DataFrame,
+    volume_shape: list,
+    pixel_size: list,
+    mean_photons: float,
+    cv: float = 0.3,
+    smooth_scale_um: float = 2.0,
+    seed: int = 42,
+) -> np.ndarray:
+    """Generate per-cell autofluorescence as a photon-count volume.
+
+    Each cell ellipsoid is filled with smooth, spatially varying intensity.
+    Cell-to-cell brightness is drawn from a log-normal distribution so the
+    population mean equals *mean_photons* per interior voxel.
+
+    Parameters
+    ----------
+    cells_df : DataFrame
+        Cell geometry table from generate_scene.py (cells.csv).
+        Required columns: center_x/y/z, axis_a/b/c, R_00…R_22.
+    volume_shape : [nz, ny, nx] in pixels
+    pixel_size   : [vz, vy, vx] in µm
+    mean_photons : mean photon count per interior voxel across all cells
+    cv           : coefficient of variation for cell-to-cell intensity (default 0.3)
+    smooth_scale_um : spatial length scale of within-cell texture in µm (default 2.0)
+    seed         : random seed
+
+    Returns
+    -------
+    float32 ndarray of shape (nz, ny, nx) — photon counts from autofluorescence
+    """
+    nz, ny, nx = volume_shape
+    vz, vy, vx = pixel_size
+
+    rng = np.random.default_rng(seed)
+    out = np.zeros((nz, ny, nx), dtype=np.float32)
+
+    # Log-normal parameters: mean of exp(X) = mean_photons for each cell
+    sigma_ln = np.sqrt(np.log(1 + cv ** 2))
+    mu_ln = np.log(mean_photons) - 0.5 * sigma_ln ** 2
+
+    smooth_sigma_vox = (
+        smooth_scale_um / vz,
+        smooth_scale_um / vy,
+        smooth_scale_um / vx,
+    )
+
+    for _, row in cells_df.iterrows():
+        cx, cy, cz = float(row["center_x"]), float(row["center_y"]), float(row["center_z"])
+        a    = float(row["axis_a"])
+        b    = float(row["axis_b"])
+        c_ax = float(row["axis_c"])
+        R_mat = np.array(
+            [[row[f"R_{ri}{ci}"] for ci in range(3)] for ri in range(3)],
+            dtype=np.float64,
+        )
+
+        max_r = max(a, b, c_ax)
+        ix_lo = max(0,  int((cx - max_r) / vx))
+        ix_hi = min(nx, int((cx + max_r) / vx) + 2)
+        iy_lo = max(0,  int((cy - max_r) / vy))
+        iy_hi = min(ny, int((cy + max_r) / vy) + 2)
+        iz_lo = max(0,  int((cz - max_r) / vz))
+        iz_hi = min(nz, int((cz + max_r) / vz) + 2)
+
+        if ix_lo >= ix_hi or iy_lo >= iy_hi or iz_lo >= iz_hi:
+            continue
+
+        IZ, IY, IX = np.mgrid[iz_lo:iz_hi, iy_lo:iy_hi, ix_lo:ix_hi]
+        dx = IX * vx - cx
+        dy = IY * vy - cy
+        dz = IZ * vz - cz
+        pts = np.stack([dx.ravel(), dy.ravel(), dz.ravel()])  # (3, N) in xyz
+        local = R_mat.T @ pts                                  # (3, N)
+        inside = (
+            local[0] ** 2 / a ** 2
+            + local[1] ** 2 / b ** 2
+            + local[2] ** 2 / c_ax ** 2
+        ) <= 1.0
+        inside = inside.reshape(IZ.shape)
+
+        if not inside.any():
+            continue
+
+        # Smooth noise texture: Gaussian-filtered white noise, normalised to
+        # mean=1, std=0.3 within the cell interior, then clipped to >=0.
+        bbox_shape = inside.shape
+        local_sigma = (
+            min(smooth_sigma_vox[0], bbox_shape[0] / 2.0),
+            min(smooth_sigma_vox[1], bbox_shape[1] / 2.0),
+            min(smooth_sigma_vox[2], bbox_shape[2] / 2.0),
+        )
+        raw = rng.standard_normal(bbox_shape).astype(np.float32)
+        smooth = gaussian_filter(raw, sigma=local_sigma)
+        interior_vals = smooth[inside]
+        s = interior_vals.std()
+        if s > 0:
+            smooth = (smooth - interior_vals.mean()) / s * 0.3 + 1.0
+        else:
+            smooth = np.ones_like(smooth)
+        smooth = np.clip(smooth, 0.0, None)
+
+        cell_photons = float(np.exp(rng.normal(mu_ln, sigma_ln)))
+        out[iz_lo:iz_hi, iy_lo:iy_hi, ix_lo:ix_hi] += (
+            smooth * inside * cell_photons
+        ).astype(np.float32)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Demo
 # ---------------------------------------------------------------------------
 
