@@ -246,20 +246,99 @@ class TheoreticalPSF:
     # Public interface
     # ------------------------------------------------------------------
 
+    def _auto_shape(
+        self,
+        voxel_size: list | tuple,
+        threshold: float = 0.01,
+        pupil_size: int = 256,
+    ) -> list[int]:
+        """Return the minimum odd-sized [nz, ny, nx] that contains the PSF peak
+        down to *threshold* times the peak intensity.
+
+        Axial extent is found by evaluating the on-axis coherent sum
+        (sum of aperture * exp(i*phase)) per z step — no FFT required.
+        Lateral extent is found from the centre row of the z=0 FFT plane.
+
+        Args:
+            voxel_size: [dz, dy, dx] voxel size in µm.
+            threshold:  intensity fraction below which a pixel is considered
+                        outside the PSF.  Default 0.01 (1 % of peak, i.e. 99 %
+                        drop).
+            pupil_size: pupil plane resolution; see :meth:`sample`.
+
+        Returns:
+            ``[nz, ny, nx]`` list of odd integers.
+        """
+        dz, dy, dx = voxel_size
+        wl = self.wavelength_nm / 1000.0
+        n = self.refractive_index
+        N = pupil_size
+
+        coords = np.arange(-N // 2, N // 2) / (N // 2)
+        U, V = np.meshgrid(coords, coords)
+        RHO = np.sqrt(U ** 2 + V ** 2)
+        THETA = np.arctan2(V, U)
+        aperture = RHO <= 1.0
+
+        W = np.zeros((N, N), dtype=float)
+        for j, coeff in self.zernike_coeffs.items():
+            W += coeff * zernike_noll(j, RHO, THETA)
+        zernike_phase = 2.0 * np.pi * W * aperture
+
+        # ---- Axial: on-axis coherent sum, no FFT ----------------------------
+        # Scan from z=0 outward in dz steps; the PSF is symmetric about z=0.
+        max_half_z = max(50.0, 10.0 * self.axial_resolution_um())
+        z_vals = np.arange(0.0, max_half_z + dz, dz)
+        axial = np.empty(len(z_vals))
+        for i, z in enumerate(z_vals):
+            arg = np.clip(1.0 - (self.NA * RHO / n) ** 2, 0.0, None)
+            prop = (2.0 * np.pi * n / wl) * z * np.sqrt(arg) * aperture
+            axial[i] = abs(np.sum(aperture * np.exp(1j * (zernike_phase + prop)))) ** 2
+        below_ax = np.where(axial < threshold * axial[0])[0]
+        half_nz = int(below_ax[0]) if len(below_ax) else len(z_vals)
+
+        # ---- Lateral: centre row of the z=0 FFT plane -----------------------
+        dl = min(dx, dy)
+        M_min = int(np.ceil(N * wl / (2.0 * self.NA * dl)))
+        M = next_fast_len(max(N, M_min))
+        actual_dl = N * wl / (2.0 * self.NA * M)  # µm per FFT pixel
+
+        pad = (M - N) // 2
+        pupil0 = aperture.astype(complex) * np.exp(1j * zernike_phase)
+        padded = np.zeros((M, M), dtype=complex)
+        padded[pad: pad + N, pad: pad + N] = pupil0
+        psf_plane = np.abs(fftshift(fft2(ifftshift(padded)))) ** 2
+
+        half_row = psf_plane[M // 2, M // 2:]  # radial profile from centre
+        peak_lat = half_row[0]
+        below_lat = np.where(half_row < threshold * peak_lat)[0]
+        half_fft_pix = int(below_lat[0]) if len(below_lat) else len(half_row)
+
+        half_ny = int(np.ceil(half_fft_pix * actual_dl / dy))
+        half_nx = int(np.ceil(half_fft_pix * actual_dl / dx))
+
+        return [2 * half_nz + 1, 2 * half_ny + 1, 2 * half_nx + 1]
+
     def sample(
         self,
         voxel_size: list | tuple,
-        shape: list | tuple,
+        shape: list | tuple | None = None,
         pupil_size: int = 256,
+        threshold: float = 0.01,
     ) -> np.ndarray:
         """Realise the PSF on a discrete voxel grid.
 
         Args:
             voxel_size: [dz, dy, dx] voxel size in µm.
-            shape:      [nz, ny, nx] output array size in pixels.
+            shape:      [nz, ny, nx] output array size in pixels, or ``None``
+                        to auto-compute the tightest shape that keeps all voxels
+                        above *threshold* times the peak intensity.
             pupil_size: number of samples across the pupil diameter.
                         Higher values give a more accurate PSF at the cost of
                         speed.  256 is sufficient for most objectives.
+            threshold:  only used when ``shape=None``.  Intensity fraction
+                        below which a voxel is considered outside the PSF.
+                        Default 0.01 (99 % drop from peak).
 
         Returns:
             float32 array of shape (nz, ny, nx).  Values are non-negative; the
@@ -274,6 +353,8 @@ class TheoreticalPSF:
         ≤ the requested *dx*, so the output is at worst very slightly
         over-sampled before cropping.  The discrepancy is typically < 0.5 %.
         """
+        if shape is None:
+            shape = self._auto_shape(voxel_size, threshold=threshold, pupil_size=pupil_size)
         nz, ny, nx = shape
         dz, dy, dx = voxel_size
         wl = self.wavelength_nm / 1000.0  # convert nm → µm
@@ -427,10 +508,11 @@ class TheoreticalPSF:
         self,
         n: int,
         voxel_size: list | tuple,
-        shape: list | tuple,
+        shape: list | tuple | None = None,
         magnitudes: dict | None = None,
         rng=None,
         pupil_size: int = 256,
+        threshold: float = 0.01,
     ) -> list:
         """Pre-compute a pool of *n* perturbed PSF arrays.
 
@@ -449,12 +531,15 @@ class TheoreticalPSF:
         Args:
             n:          Number of distinct PSF arrays to generate.
             voxel_size: ``[dz, dy, dx]`` voxel size in µm.
-            shape:      ``[nz, ny, nx]`` output array size in pixels.
+            shape:      ``[nz, ny, nx]`` output array size in pixels, or
+                        ``None`` to auto-compute from the base (un-perturbed)
+                        PSF.  The same shape is reused for all pool members.
             magnitudes: Passed to :meth:`perturb`; ``None`` uses defaults.
             rng:        ``numpy.random.Generator``, integer seed, or ``None``.
                         A single RNG is shared across all perturbations so the
                         pool is reproducible from a single seed.
             pupil_size: Pupil plane resolution; see :meth:`sample`.
+            threshold:  Only used when ``shape=None``; see :meth:`sample`.
 
         Returns:
             List of *n* ``float32`` arrays of shape ``(nz, ny, nx)``, each
@@ -462,6 +547,8 @@ class TheoreticalPSF:
         """
         if not isinstance(rng, np.random.Generator):
             rng = np.random.default_rng(rng)
+        if shape is None:
+            shape = self._auto_shape(voxel_size, threshold=threshold, pupil_size=pupil_size)
         return [
             self.perturb(magnitudes=magnitudes, rng=rng).sample(
                 voxel_size=voxel_size, shape=shape, pupil_size=pupil_size
