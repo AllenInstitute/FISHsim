@@ -160,7 +160,12 @@ class Simulator:
             emitter_pos = np.array(cell_emitters)
             cell_ids = np.array(cell_ids)
             num_emitter = len(emitter_pos)
-            r = np.random.randint(0, len(barcodes), size=num_emitter).tolist()
+            if "distribution" in codebook.columns:
+                weights = codebook["distribution"].fillna(1).astype(float).values
+                weights = weights / weights.sum()
+                r = np.random.choice(len(barcodes), size=num_emitter, p=weights).tolist()
+            else:
+                r = np.random.randint(0, len(barcodes), size=num_emitter).tolist()
         else:
             emitter_pos = random_emitter_position(
                 x_dim=(0, x_um - 1),
