@@ -13,7 +13,7 @@ output_dir: C:/Users/miket/fishsimoutput
 volume: [16.0, 303.6, 303.6]
 
 # Cell half-axis [min, max] in µm. All three principal axes use the same range.
-cell_radius: [10.0, 15.0]
+cell_radius: [7.0, 9.0]
 
 # Fraction of the volume treated as occupied when estimating cell count.
 # ~0.64 is the theoretical random close-packing limit for spheres; 0.55 is

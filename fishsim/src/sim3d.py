@@ -318,52 +318,90 @@ def _process_block(
     volume_shape: tuple,
     batch_size: int = 32,
 ) -> np.ndarray:
+    from scipy.signal import fftconvolve
+
     block_points = _points_overlapping_block(points_arrays, block_slices, psf.shape)
-    n_points = len(block_points["frame"])
     block_shape = tuple(s.stop - s.start for s in block_slices)
-    result = np.zeros(block_shape, dtype=np.float32)
 
-    for i in range(0, n_points, batch_size):
-        idx = slice(i, min(i + batch_size, n_points))
+    if len(block_points["frame"]) == 0:
+        return np.zeros(block_shape, dtype=np.float32)
 
-        phase_ramps = np.exp(
-            -1j * 2 * np.pi * (
-                FZ[None] * block_points["frame_shift"][idx, None, None, None]
-                + FR[None] * block_points["row_shift"][idx, None, None, None]
-                + FC[None] * block_points["column_shift"][idx, None, None, None]
-            )
-        )
-        all_shifted = np.real(
-            np.fft.ifftn(psf_fft[None] * phase_ramps, axes=(1, 2, 3))
-        )
+    # Scatter each emitter's unit amplitude across its 8 nearest integer-voxel
+    # neighbours with trilinear weights (vectorised; no per-emitter Python loop),
+    # then convolve the resulting sparse volume with the PSF in one FFT call.
+    #
+    # Padding: (psf_size//2) left + (psf_size - psf_size//2 + 1) right ensures
+    # fftconvolve(mode='valid') returns (block_size + 2) per axis; trimming [1:-1]
+    # recovers block_shape.  The +1 absorbs the boundary emitters included by
+    # _points_overlapping_block's margin for both even- and odd-sized PSFs.
+    pad = [(s // 2, s - s // 2 + 1) for s in psf.shape]
+    emitter_shape = tuple(b + p[0] + p[1] for b, p in zip(block_shape, pad))
+    emitter_vol = np.zeros(emitter_shape, dtype=np.float32)
 
-        for j, pt_idx in enumerate(range(i, min(i + batch_size, n_points))):
-            shifted_psf = all_shifted[j][psf_crop_slices]
-            vol_slices, psf_slices = _compute_insertion_slices(
-                row=int(block_points["row"][pt_idx]),
-                col=int(block_points["column"][pt_idx]),
-                z=int(block_points["frame"][pt_idx]),
-                psf_shape=psf.shape,
-                volume_shape=volume_shape,
-            )
-            local_slices = tuple(
-                slice(s.start - b.start, s.stop - b.start)
-                for s, b in zip(vol_slices, block_slices)
-            )
-            clipped_local, clipped_psf = [], []
-            for ls, ps, bs in zip(local_slices, psf_slices, block_shape):
-                l_start = max(ls.start, 0)
-                l_stop = min(ls.stop, bs)
-                p_start = ps.start + (l_start - ls.start)
-                p_stop = p_start + (l_stop - l_start)
-                if l_stop <= l_start:
-                    break
-                clipped_local.append(slice(l_start, l_stop))
-                clipped_psf.append(slice(p_start, p_stop))
-            else:
-                result[tuple(clipped_local)] += shifted_psf[tuple(clipped_psf)]
+    iz = (block_points["frame"]  - block_slices[0].start + pad[0][0]).astype(np.intp)
+    iy = (block_points["row"]    - block_slices[1].start + pad[1][0]).astype(np.intp)
+    ix = (block_points["column"] - block_slices[2].start + pad[2][0]).astype(np.intp)
+    dz = block_points["frame_shift"].astype(np.float64)
+    dy = block_points["row_shift"].astype(np.float64)
+    dx = block_points["column_shift"].astype(np.float64)
 
-    return result
+    # Build all 8 trilinear corner contributions in one vectorised bincount call.
+    # bincount is a C loop that releases the GIL, unlike np.add.at which holds it.
+    s1, s2 = emitter_shape[1], emitter_shape[2]
+    iz_c = np.concatenate([iz,   iz,   iz,   iz,   iz+1, iz+1, iz+1, iz+1])
+    iy_c = np.concatenate([iy,   iy,   iy+1, iy+1, iy,   iy,   iy+1, iy+1])
+    ix_c = np.concatenate([ix,   ix+1, ix,   ix+1, ix,   ix+1, ix,   ix+1])
+    wz   = np.concatenate([1-dz, 1-dz, 1-dz, 1-dz, dz,   dz,   dz,   dz  ])
+    wy   = np.concatenate([1-dy, 1-dy, dy,   dy,   1-dy, 1-dy, dy,   dy  ])
+    wx   = np.concatenate([1-dx, dx,   1-dx, dx,   1-dx, dx,   1-dx, dx  ])
+    flat = iz_c * (s1 * s2) + iy_c * s2 + ix_c
+    emitter_vol += np.bincount(flat, weights=wz * wy * wx,
+                               minlength=emitter_vol.size).reshape(emitter_shape).astype(np.float32)
+
+    result = fftconvolve(emitter_vol, psf, mode="valid")
+    return result[tuple(slice(1, 1 + s) for s in block_shape)].astype(np.float32)
+
+
+def build_emitter_density_volume(
+    channel_df: pd.DataFrame,
+    volume_shape: tuple,
+) -> np.ndarray:
+    """Scatter emitter positions into a full 3D density grid without PSF convolution.
+
+    channel_df must already be filtered to the desired bit positions and must
+    have 'frame', 'row', 'column', 'frame_shift', 'row_shift', 'column_shift'
+    columns (produced by compute_pixel_locations).
+
+    The returned float32 array can be saved and later convolved with any PSF
+    via psf_sweep.py without re-running the expensive scatter step.
+    """
+    vol = np.zeros(volume_shape, dtype=np.float32)
+    if channel_df.empty:
+        return vol
+
+    nz, ny, nx = volume_shape
+    iz = channel_df["frame"].to_numpy().astype(np.intp)
+    iy = channel_df["row"].to_numpy().astype(np.intp)
+    ix = channel_df["column"].to_numpy().astype(np.intp)
+    dz = channel_df["frame_shift"].to_numpy().astype(np.float64)
+    dy = channel_df["row_shift"].to_numpy().astype(np.float64)
+    dx = channel_df["column_shift"].to_numpy().astype(np.float64)
+
+    # Drop emitters whose upper corner would fall outside the volume.
+    valid = (iz >= 0) & (iz + 1 < nz) & (iy >= 0) & (iy + 1 < ny) & (ix >= 0) & (ix + 1 < nx)
+    iz, iy, ix = iz[valid], iy[valid], ix[valid]
+    dz, dy, dx = dz[valid], dy[valid], dx[valid]
+
+    iz_c = np.concatenate([iz,   iz,   iz,   iz,   iz+1, iz+1, iz+1, iz+1])
+    iy_c = np.concatenate([iy,   iy,   iy+1, iy+1, iy,   iy,   iy+1, iy+1])
+    ix_c = np.concatenate([ix,   ix+1, ix,   ix+1, ix,   ix+1, ix,   ix+1])
+    wz   = np.concatenate([1-dz, 1-dz, 1-dz, 1-dz, dz,   dz,   dz,   dz  ])
+    wy   = np.concatenate([1-dy, 1-dy, dy,   dy,   1-dy, 1-dy, dy,   dy  ])
+    wx   = np.concatenate([1-dx, dx,   1-dx, dx,   1-dx, dx,   1-dx, dx  ])
+    flat = iz_c * (ny * nx) + iy_c * nx + ix_c
+    vol += np.bincount(flat, weights=wz * wy * wx,
+                       minlength=vol.size).reshape(volume_shape).astype(np.float32)
+    return vol
 
 
 def build_tile_point_im(

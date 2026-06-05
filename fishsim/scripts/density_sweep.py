@@ -7,6 +7,13 @@ Each level is a cumulative superset of the previous one: the same spots appear
 at every level they are included in, so decoded results across levels are
 directly comparable.
 
+Because the photon image is a linear sum of per-emitter PSF contributions,
+each density level only needs to render the *new* emitters added since the
+previous level (the delta).  The pre-noise photon images are accumulated
+across levels; camera noise is applied fresh at each level.  This reduces
+total render work from O(sum of fractions) to O(1) regardless of how many
+density levels are requested.
+
 Imaging rounds within each density level are rendered concurrently via
 concurrent.futures.ThreadPoolExecutor.  Total CPU threads used is approximately
 --num-round-workers × --num-dask-workers.
@@ -42,6 +49,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 import argparse
 import concurrent.futures
 import json
+import time
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -56,7 +64,8 @@ from fishsim.scripts.render_images import (
     _find_groundtruth_paths,
     load_psf,
     prepare_psf_fft,
-    _render_channel,
+    _filter_channel_df,
+    _render_channel_photons,
     _make_dapi_channel,
     _make_xml,
 )
@@ -69,8 +78,9 @@ def parse_args():
     )
     p.add_argument("--scene-dir", required=True,
                    help="Directory produced by generate_scene.py")
-    p.add_argument("--psf", required=True,
-                   help="Path to PSF pickle keyed by (channel, y_px, x_px)")
+    p.add_argument("--psf", default=None,
+                   help="Path to PSF pickle keyed by (channel, y_px, x_px). "
+                        "Required unless --no-images is set.")
     p.add_argument(
         "--psf-position", nargs=2, type=int, default=[1200, 1200],
         metavar=("Y_PX", "X_PX"),
@@ -160,43 +170,65 @@ def parse_args():
                    help="Camera QE curve CSV (requires --camera-mode)")
     p.add_argument("--camera-mode", default=None, metavar="MODE",
                    help="Readout mode key in --camera-spec-file")
+    p.add_argument(
+        "--save-density-volumes", action="store_true", default=False,
+        help=(
+            "Save pre-convolution emitter density volumes to zarr alongside each "
+            "density level's images.  These can be convolved with alternative PSFs "
+            "by psf_sweep.py without re-running the scatter step."
+        ),
+    )
+    p.add_argument(
+        "--no-images", action="store_true", default=False,
+        help=(
+            "Skip PSF convolution and image writes entirely; only scatter emitters "
+            "and save density volumes.  Requires --save-density-volumes.  Use "
+            "psf_sweep.py afterwards to produce images with any PSF."
+        ),
+    )
     return p.parse_args()
 
 
-def _build_cumulative_samples(
+def _build_samples(
     df: pd.DataFrame,
     fractions: list[float],
     rng: np.random.Generator,
-) -> list[pd.DataFrame]:
-    """Return one DataFrame per fraction, each a cumulative superset of the last.
+) -> tuple[list[pd.DataFrame], list[pd.DataFrame]]:
+    """Return (cumulative_dfs, delta_dfs) for each fraction.
 
-    A single random permutation of all rows is generated once; level k uses the
-    first floor(fractions[k] * n) rows of that permutation.  Fractions must be
-    sorted ascending before calling (callers ensure this).
+    A single random permutation is generated once.  Level k's cumulative df
+    contains the first floor(fractions[k] * n) rows; its delta df contains
+    only the rows added since the previous level.  Fractions must be sorted
+    ascending (callers ensure this).
     """
     n = len(df)
     perm = rng.permutation(n)
-    dfs = []
+    cumulative_dfs, delta_dfs = [], []
+    prev_k = 0
     for frac in fractions:
         k = max(1, int(round(frac * n)))
-        dfs.append(df.iloc[perm[:k]].reset_index(drop=True))
-    return dfs
+        cumulative_dfs.append(df.iloc[perm[:k]].reset_index(drop=True))
+        delta_dfs.append(df.iloc[perm[prev_k:k]].reset_index(drop=True))
+        prev_k = k
+    return cumulative_dfs, delta_dfs
 
 
 def _render_round(
     round_num: int,
-    df: pd.DataFrame,
+    delta_df: pd.DataFrame,
+    photon_accum: list | None,   # list[np.ndarray] per dye — mutated; None if no_images
     n_bits: int,
     n_dyes: int,
     dye_channels: list,
+    dye_names: list,
     FZ, FR, FC,
-    psf_fft: np.ndarray,
+    psf_fft,
     psf_crop_slices,
-    psf: np.ndarray,
+    psf,
     volume_shape: list,
     block_shape: tuple,
     pixel_size: list,
-    camera: CameraSimulator,
+    camera: CameraSimulator | None,
     exposure_s: float,
     dask_workers: int,
     dapi_im: np.ndarray | None,
@@ -204,8 +236,16 @@ def _render_round(
     tile_idx: int,
     volume_um: list,
     hyb_folder: Path,
+    emitter_accum: list | None = None,
+    vol_save_dir: Path | None = None,
+    no_images: bool = False,
 ) -> None:
-    """Render one imaging round and write zarr + XML to hyb_folder."""
+    """Render delta emitters for one round, accumulate photons, write zarr.
+
+    When no_images=True, PSF convolution and all image writes are skipped; only
+    the emitter scatter/accumulate/save path runs.  emitter_accum and
+    vol_save_dir must be provided in that case.
+    """
     import zarr
 
     n_z = volume_shape[0]
@@ -215,18 +255,55 @@ def _render_round(
         for di in range(n_dyes)
     ]
 
-    def _render_dye(dye_idx):
+    def _render_delta_dye(dye_idx):
+        if emitter_accum is not None:
+            channel_df = _filter_channel_df(delta_df, bits_per_dye[dye_idx])
+            delta_emitter = sim3d.build_emitter_density_volume(
+                channel_df, tuple(volume_shape)
+            )
+            emitter_accum[dye_idx] += delta_emitter
+
+        if no_images:
+            return None
+
         dye, wavelength = dye_channels[dye_idx]
-        return _render_channel(
-            df, bits_per_dye[dye_idx],
+        delta_photon = _render_channel_photons(
+            delta_df, bits_per_dye[dye_idx],
             FZ, FR, FC, psf_fft, psf_crop_slices, psf,
-            volume_shape, block_shape,
-            dye, wavelength, camera, exposure_s, dask_workers,
-            autofluorescence_im=autofluorescence_im,
+            volume_shape, block_shape, dye, exposure_s, dask_workers,
+            show_progress=False,
         )
+        photon_accum[dye_idx] += delta_photon
+        photon_for_camera = photon_accum[dye_idx].copy()
+        if autofluorescence_im is not None:
+            photon_for_camera = photon_for_camera + autofluorescence_im
+        return camera.simulate_image(photon_for_camera, wavelength, exposure_s)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(dye_channels)) as dye_pool:
-        channel_images = list(dye_pool.map(_render_dye, range(len(dye_channels))))
+        channel_images = list(dye_pool.map(_render_delta_dye, range(len(dye_channels))))
+
+    if vol_save_dir is not None and emitter_accum is not None:
+        vol_save_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            import numcodecs
+            compressor = numcodecs.Blosc(cname="zstd", clevel=3,
+                                         shuffle=numcodecs.Blosc.BITSHUFFLE)
+        except ImportError:
+            compressor = None
+        for dye_idx, name in enumerate(dye_names):
+            vol_path = str(vol_save_dir / f"dye{dye_idx}_{name}.zarr")
+            z = zarr.open_array(
+                vol_path, mode="w",
+                shape=emitter_accum[dye_idx].shape, dtype="float32",
+                chunks=emitter_accum[dye_idx].shape,
+                compressor=compressor,
+                zarr_format=2,
+            )
+            z[:] = emitter_accum[dye_idx]
+
+    if no_images:
+        print(f"  [H{round_num+1} tile{tile_idx}] volumes saved → {vol_save_dir}")
+        return
 
     n_channels_total = n_dyes + (1 if dapi_im is not None else 0)
     all_channels = channel_images + ([dapi_im] if dapi_im is not None else [])
@@ -279,6 +356,11 @@ def main():
     if bad:
         raise ValueError(f"All density fractions must be in (0, 1]; got {bad}")
 
+    if args.no_images and not args.save_density_volumes:
+        raise ValueError("--no-images requires --save-density-volumes")
+    if not args.no_images and args.psf is None:
+        raise ValueError("--psf is required unless --no-images is set")
+
     fractions = sorted(set(args.density_fractions))
     dye_channels = _resolve_dyes(args.dyes, args.dye_wavelengths)
     n_dyes = len(dye_channels)
@@ -301,17 +383,30 @@ def main():
     print(f"Volume shape: {volume_shape}  |  {n_bits} bits  |  {n_rounds} rounds")
     print(f"Density levels ({len(fractions)}): {fractions}")
     print(f"Concurrency: {args.num_round_workers} rounds × {args.num_dask_workers} dask workers")
-
-    print(f"Loading PSF from {args.psf}...")
-    psf = load_psf(
-        Path(args.psf), args.psf_channel,
-        args.psf_position[0], args.psf_position[1],
+    total_frac = sum(fractions[0:1]) + sum(
+        fractions[i] - fractions[i - 1] for i in range(1, len(fractions))
     )
-    psf_fft, _, psf_crop_slices, FZ, FR, FC = prepare_psf_fft(psf)
+    print(f"Incremental render: {fractions[-1]:.0%} total work "
+          f"(vs {sum(fractions):.0%} if rendered from scratch each level)")
+    if args.no_images:
+        print("--no-images: skipping PSF convolution and image writes")
+
+    if args.no_images:
+        psf = psf_fft = psf_crop_slices = FZ = FR = FC = None
+        camera = None
+    else:
+        print(f"Loading PSF from {args.psf}...")
+        psf = load_psf(
+            Path(args.psf), args.psf_channel,
+            args.psf_position[0], args.psf_position[1],
+        )
+        psf_fft, _, psf_crop_slices, FZ, FR, FC = prepare_psf_fft(psf)
 
     exposure_s = args.exposure_ms * k.milli * args.brightness_scale
 
-    if args.camera_spec_file and args.camera_mode:
+    if args.no_images:
+        camera = None
+    elif args.camera_spec_file and args.camera_mode:
         camera = CameraSimulator(
             spec_file=Path(args.camera_spec_file),
             qe_file=Path(args.camera_qe_file) if args.camera_qe_file else None,
@@ -352,6 +447,8 @@ def main():
 
     rng = np.random.default_rng(args.seed)
 
+    t = time.time()
+
     for tile_idx, gt_path in enumerate(gt_paths):
         print(f"\n=== Tile {tile_idx + 1}/{len(gt_paths)}: {gt_path} ===")
         df_full = pd.read_csv(
@@ -367,23 +464,56 @@ def main():
             df_full[["z", "y", "x"]].to_numpy(), pixel_size=pixel_size
         )
 
-        density_dfs = _build_cumulative_samples(df_full, fractions, rng)
+        cumulative_dfs, delta_dfs = _build_samples(df_full, fractions, rng)
 
-        for frac, df_level in zip(fractions, density_dfs):
-            n_level = len(df_level)
+        # photon_accum: not needed when --no-images
+        photon_accum = (
+            None if args.no_images else
+            {rn: [np.zeros(volume_shape, dtype=np.float32) for _ in range(n_dyes)]
+             for rn in range(n_rounds)}
+        )
+        # emitter_accum: allocated when --save-density-volumes (implied by --no-images)
+        emitter_accum = (
+            {rn: [np.zeros(volume_shape, dtype=np.float32) for _ in range(n_dyes)]
+             for rn in range(n_rounds)}
+            if args.save_density_volumes else None
+        )
+
+        for frac, cumulative_df, delta_df in zip(fractions, cumulative_dfs, delta_dfs):
+            n_level = len(cumulative_df)
+            n_delta = len(delta_df)
             label = f"density_{frac:.3f}"
-            print(f"\n--- {label}: {n_level}/{n_total} emitters ({frac:.1%}) ---")
+            print(f"\n--- {label}: +{n_delta} new emitters "
+                  f"({n_level}/{n_total} cumulative, {frac:.1%}) ---")
 
             level_dir = output_dir / label
             level_dir.mkdir(parents=True, exist_ok=True)
 
             gt_out = level_dir / f"tile_{tile_idx:03d}_groundtruth.csv"
-            df_level.to_csv(gt_out, index=False)
+            cumulative_df.to_csv(gt_out, index=False)
             print(f"  Groundtruth → {gt_out}")
 
             level_meta = {**meta, "density_fraction": frac, "n_emitters_rendered": n_level}
             with open(level_dir / "scene_meta.json", "w") as f:
                 json.dump(level_meta, f, indent=2)
+
+            if args.save_density_volumes:
+                ev_meta = {
+                    "volume_shape": volume_shape,
+                    "pixel_size": pixel_size,
+                    "dye_names": args.dyes,
+                    "dye_wavelengths": [wl for _, wl in dye_channels],
+                    "n_bits": n_bits,
+                    "n_rounds": n_rounds,
+                    "n_dyes": n_dyes,
+                    "exposure_s": exposure_s,
+                    "tag": args.tag,
+                    "set_num": args.set_num,
+                    "density_fraction": frac,
+                    "n_emitters": n_level,
+                }
+                with open(level_dir / "emitter_volumes_meta.json", "w") as f:
+                    json.dump(ev_meta, f, indent=2)
 
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=args.num_round_workers
@@ -391,13 +521,20 @@ def main():
                 futures = {
                     pool.submit(
                         _render_round,
-                        round_num, df_level, n_bits, n_dyes, dye_channels,
+                        round_num,
+                        delta_df,
+                        photon_accum[round_num] if photon_accum else None,
+                        n_bits, n_dyes, dye_channels, args.dyes,
                         FZ, FR, FC, psf_fft, psf_crop_slices, psf,
                         volume_shape, tuple(args.block_shape), pixel_size,
                         camera, exposure_s, args.num_dask_workers,
                         dapi_im, autofluorescence_im,
                         tile_idx, volume_um,
                         level_dir / f"H{round_num + 1}_{args.tag}_set{args.set_num}",
+                        emitter_accum[round_num] if emitter_accum else None,
+                        level_dir / "emitter_volumes" / f"H{round_num + 1}"
+                        if args.save_density_volumes else None,
+                        args.no_images,
                     ): round_num
                     for round_num in range(n_rounds)
                 }
@@ -410,7 +547,9 @@ def main():
                             f"Round {rn + 1} failed at {label}"
                         ) from exc
 
-    print(f"\nDensity sweep complete. Output in {output_dir}")
+    elapsed_s = time.time() - t
+    print(f"\nTotal elapsed time: {elapsed_s/60:.1f} min ({elapsed_s/3600:.2f} h)")
+    print(f"Density sweep complete. Output in {output_dir}")
 
 
 if __name__ == "__main__":

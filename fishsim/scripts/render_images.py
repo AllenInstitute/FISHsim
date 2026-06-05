@@ -288,6 +288,60 @@ def _find_groundtruth_paths(scene_dir: Path) -> list:
     return paths
 
 
+def _filter_channel_df(df: pd.DataFrame, bit_positions: list[int]) -> pd.DataFrame:
+    """Return rows whose observed_barcode has '1' at any position in bit_positions."""
+    if not bit_positions or df.empty:
+        return df.iloc[:0]
+    barcodes = df["observed_barcode"]
+    bc_arr = np.frombuffer(
+        "".join(barcodes.values).encode("ascii"), dtype=np.uint8
+    ).reshape(len(barcodes), -1)
+    on_mask = np.any(bc_arr[:, bit_positions] == ord("1"), axis=1)
+    return df[on_mask]
+
+
+def _render_channel_photons(
+    df: pd.DataFrame,
+    bit_positions: list[int],
+    FZ, FR, FC,
+    psf_fft, psf_crop_slices, psf,
+    volume_shape: list,
+    block_shape: tuple,
+    dye: DyeSimulator,
+    exposure_s: float,
+    num_workers: int,
+    show_progress: bool = True,
+) -> np.ndarray:
+    """Render one dye channel, returning the pre-noise float32 photon image.
+
+    No autofluorescence and no camera simulation are applied; those are
+    handled by the caller so that photon images from successive density levels
+    can be accumulated before adding noise.
+    """
+    import time
+
+    channel_df = _filter_channel_df(df, bit_positions)
+
+    if channel_df.empty:
+        return np.zeros(volume_shape, dtype=np.float32)
+
+    tile_im_dask = sim3d.build_tile_point_im(
+        channel_df, FZ, FR, FC, psf_fft, psf_crop_slices, psf,
+        volume_shape=volume_shape,
+        block_shape=block_shape,
+    )
+    photon_im_dask = dye.psf_to_photon_distribution(tile_im_dask.clip(min=0), exposure_s)
+    t0 = time.perf_counter()
+    if show_progress:
+        with ProgressBar():
+            photon_im = photon_im_dask.compute(num_workers=num_workers)
+    else:
+        photon_im = photon_im_dask.compute(num_workers=num_workers)
+    print(f"  compute() wall time: {time.perf_counter() - t0:.1f}s  "
+          f"({len(channel_df)} spots, {num_workers} workers)")
+    return photon_im
+
+
 def _render_channel(
     df: pd.DataFrame,
     bit_positions: list[int],
@@ -301,37 +355,19 @@ def _render_channel(
     exposure_s: float,
     num_workers: int,
     autofluorescence_im: np.ndarray | None = None,
+    show_progress: bool = True,
 ) -> np.ndarray:
     """Render one dye channel for a given set of bit positions.
 
     Spots are included if any of their mapped_barcode bits at *bit_positions*
     is '1'. Returns a uint16 array of shape (n_z, n_y, n_x).
     """
-    barcodes = df["observed_barcode"]
-    on_mask = barcodes.apply(
-        lambda b: any(len(b) > bp and b[bp] == "1" for bp in bit_positions)
+    photon_im = _render_channel_photons(
+        df, bit_positions, FZ, FR, FC, psf_fft, psf_crop_slices, psf,
+        volume_shape, block_shape, dye, exposure_s, num_workers, show_progress,
     )
-    channel_df = df[on_mask]
-
-    if channel_df.empty:
-        photon_im = np.zeros(volume_shape, dtype=np.float32)
-    else:
-        tile_im_dask = sim3d.build_tile_point_im(
-            channel_df, FZ, FR, FC, psf_fft, psf_crop_slices, psf,
-            volume_shape=volume_shape,
-            block_shape=block_shape,
-        )
-        import time
-        photon_im_dask = dye.psf_to_photon_distribution(tile_im_dask.clip(min=0), exposure_s)
-        t0 = time.perf_counter()
-        with ProgressBar():
-            photon_im = photon_im_dask.compute(num_workers=num_workers)
-        print(f"  compute() wall time: {time.perf_counter() - t0:.1f}s  "
-              f"({len(channel_df)} spots, {num_workers} workers)")
-
     if autofluorescence_im is not None:
         photon_im = photon_im + autofluorescence_im
-
     return camera.simulate_image(photon_im, wavelength, exposure_s)
 
 

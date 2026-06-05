@@ -8,11 +8,20 @@ Signal chain:
         → uint16 image
 """
 
+import threading
 import numpy as np
 import dask.array as da
 from numpy.typing import ArrayLike
 import json
 from pathlib import Path
+
+_rng_local = threading.local()
+
+def _rng() -> np.random.Generator:
+    """Return a thread-local RNG (releases GIL, unlike legacy np.random)."""
+    if not hasattr(_rng_local, "gen"):
+        _rng_local.gen = np.random.default_rng()
+    return _rng_local.gen
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +48,7 @@ def make_dark_current_image(
         image_shape: (z, y, x) or (y, x) shape of the output array
     """
     mean_dark = dark_current * exposure_time
-    return np.random.poisson(mean_dark, size=image_shape)
+    return _rng().poisson(mean_dark, size=image_shape)
 
 
 # ---------------------------------------------------------------------------
@@ -173,8 +182,10 @@ class CameraSimulator:
         """
         qe = self.QE.get(round(wavelength), self.QE.get(wavelength, 1.0))
 
+        rng = _rng()
+
         # 1. Shot noise
-        photon_noisy = np.random.poisson(photon_image.astype(np.float64))
+        photon_noisy = rng.poisson(photon_image.astype(np.float32))
 
         # 2. Quantum efficiency
         electrons = photon_noisy * qe
@@ -186,7 +197,7 @@ class CameraSimulator:
 
         # 4. Read noise
         if self.read_noise > 0:
-            electrons = electrons + np.random.normal(0, self.read_noise, size=photon_image.shape)
+            electrons = electrons + rng.normal(0, self.read_noise, size=photon_image.shape)
 
         # 5. Gain and bias
         counts = electrons / self.gain + self.bias
