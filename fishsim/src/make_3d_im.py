@@ -102,7 +102,7 @@ def main(
     with ProgressBar():
         tile_photon_im = tile_photon_im.compute(num_workers=64)
 
-    camera = CameraSimulator(QE={561: 0.8}, gain=1. / 0.25, bias=100,
+    camera = CameraSimulator(QE={561: 0.8}, gain=0.25, bias=100,
                              dark_current=1., read_noise=0, well_depth=15000)
     noisy_image = camera.simulate_image(tile_photon_im, 561, exposure_s)
 

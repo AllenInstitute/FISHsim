@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E \"\\\\.py$|^d\")",
+      "Read(//z/MERFISHp/sim_scenes/densitySweepPhotonImages/density_0.683/**)",
+      "Bash(git -C /c/Users/miket/Documents/projects/FISHsim log --oneline -20)",
+      "Bash(git -C /c/Users/miket/Documents/projects/FISHsim remote -v)",
+      "Bash(python3 -c ' *)",
+      "Bash(python -c ' *)",
+      "Bash(conda run -n fishsim python -c ' *)",
+      "Bash(/c/Users/miket/AppData/Local/miniconda3/envs/fishsim/python -c ' *)",
+      "Bash(/c/Users/miket/.conda/envs/fishsim/python.exe -c ' *)",
+      "Bash(claude --version)",
+      "Bash(claude auth *)"
+    ]
+  }
+}

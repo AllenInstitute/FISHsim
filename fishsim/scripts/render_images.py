@@ -546,7 +546,7 @@ def main():
         qe_map = {wl: 0.85 for _, wl in dye_channels}  # placeholder QE
         camera = CameraSimulator(
             QE=qe_map,
-            gain=1.0 / 0.25,
+            gain=0.25,
             bias=100,
             dark_current=1.0,
             read_noise=1.8,

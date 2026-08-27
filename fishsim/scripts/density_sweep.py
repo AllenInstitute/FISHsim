@@ -415,7 +415,7 @@ def main():
     else:
         qe_map = {wl: 0.85 for _, wl in dye_channels}
         camera = CameraSimulator(
-            QE=qe_map, gain=1.0 / 0.25, bias=100,
+            QE=qe_map, gain=0.25, bias=100,
             dark_current=1.0, read_noise=1.8, well_depth=15000,
         )
 
@@ -425,6 +425,9 @@ def main():
 
     cells_csv = scene_dir / "cells.csv"
     cells_df = pd.read_csv(cells_csv) if cells_csv.exists() else None
+    if cells_csv.exists():
+        import shutil
+        shutil.copy2(cells_csv, output_dir / "cells.csv")
 
     # DAPI and autofluorescence depend only on cell geometry, not emitter density.
     # Compute once and share across all density levels.

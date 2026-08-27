@@ -330,11 +330,12 @@ def _process_block(
     # neighbours with trilinear weights (vectorised; no per-emitter Python loop),
     # then convolve the resulting sparse volume with the PSF in one FFT call.
     #
-    # Padding: (psf_size//2) left + (psf_size - psf_size//2 + 1) right ensures
-    # fftconvolve(mode='valid') returns (block_size + 2) per axis; trimming [1:-1]
-    # recovers block_shape.  The +1 absorbs the boundary emitters included by
-    # _points_overlapping_block's margin for both even- and odd-sized PSFs.
-    pad = [(s // 2, s - s // 2 + 1) for s in psf.shape]
+    # Padding: (psf_size//2) left + (psf_size - psf_size//2) right ensures
+    # fftconvolve(mode='valid') returns (block_size + 1) per axis; trimming [:-1]
+    # recovers block_shape.  The right margin keeps the iz+1 trilinear corner of
+    # right-boundary emitters in bounds.  Using P-P//2+1 (block+2) with [1:-1]
+    # would shift every PSF peak by -1 voxel relative to ground truth.
+    pad = [(s // 2, s - s // 2) for s in psf.shape]
     emitter_shape = tuple(b + p[0] + p[1] for b, p in zip(block_shape, pad))
     emitter_vol = np.zeros(emitter_shape, dtype=np.float32)
 
@@ -358,8 +359,9 @@ def _process_block(
     emitter_vol += np.bincount(flat, weights=wz * wy * wx,
                                minlength=emitter_vol.size).reshape(emitter_shape).astype(np.float32)
 
-    result = fftconvolve(emitter_vol, psf, mode="valid")
-    return result[tuple(slice(1, 1 + s) for s in block_shape)].astype(np.float32)
+    psf_norm = psf / psf.sum()
+    result = fftconvolve(emitter_vol, psf_norm, mode="valid")
+    return result[tuple(slice(0, s) for s in block_shape)].astype(np.float32)
 
 
 def build_emitter_density_volume(

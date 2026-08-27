@@ -31,24 +31,14 @@ import numpy as np
 import zarr
 
 
-def _channel_names_from_params(params: dict) -> list[str]:
-    """Derive ordered channel names from render_params.json.
-
-    Duplicate dye names (e.g. three CY3 channels) are disambiguated by
-    appending a zero-based index: CY3_0, CY3_1, CY3_2.
-    """
-    raw = [d["name"] for d in params["derived"]["dye_channels"]]
-    no_dapi = params["args"].get("no_dapi", False)
-    if not no_dapi:
-        raw = raw + ["DAPI"]
-
+def _disambiguate_names(names: list[str]) -> list[str]:
+    """Append _0, _1, ... suffix to duplicate names."""
     counts = {}
-    for name in raw:
+    for name in names:
         counts[name] = counts.get(name, 0) + 1
-
     seen = {}
     result = []
-    for name in raw:
+    for name in names:
         if counts[name] > 1:
             idx = seen.get(name, 0)
             result.append(f"{name}_{idx}")
@@ -56,6 +46,40 @@ def _channel_names_from_params(params: dict) -> list[str]:
         else:
             result.append(name)
     return result
+
+
+def _channel_names_from_params(params: dict) -> list[str]:
+    """Derive ordered channel names from render_params.json."""
+    raw = [d["name"] for d in params["derived"]["dye_channels"]]
+    if not params["args"].get("no_dapi", False):
+        raw = raw + ["DAPI"]
+    return _disambiguate_names(raw)
+
+
+def _meta_from_scene_meta(
+    meta_path: Path,
+    fov_data_path: Path | None = None,
+) -> tuple[int, list[str], list[float]]:
+    """Extract (n_z, channel_names, pixel_size) from psf_sweep scene_meta.json.
+
+    DAPI presence is autodetected from the zarr frame count when fov_data_path
+    is provided, since scene_meta does not record whether DAPI was rendered.
+    """
+    with open(meta_path) as f:
+        meta = json.load(f)
+    n_z = meta["volume_shape"][0]
+    n_dyes = meta["n_dyes"]
+    dye_names = meta["dye_names"][:n_dyes]
+    pixel_size = meta["pixel_size"]
+
+    channel_names = _disambiguate_names(dye_names)
+    if fov_data_path is not None:
+        arr = zarr.open_array(str(fov_data_path), mode="r")
+        n_channels_total = (arr.shape[0] - 1) // n_z
+        if n_channels_total > len(channel_names):
+            channel_names = channel_names + ["DAPI"]
+
+    return n_z, channel_names, pixel_size
 
 
 def load_fov(
@@ -156,13 +180,17 @@ def view_output(
     fov: str | None = None,
     scale: list[float] | None = None,
 ):
-    """Load a FOV from a render_images output directory and open it in napari.
+    """Load a FOV from a render_images or psf_sweep output directory and open it in napari.
+
+    Accepts directories written by either render_images.py (render_params.json)
+    or psf_sweep.py (scene_meta.json).
 
     Args:
-        output_dir: top-level directory written by render_images.py.
+        output_dir: top-level directory (render_images) or density-level directory
+                    (psf_sweep, e.g. ``<output-dir>/<psf_label>/density_0.050``).
         hyb: hyb folder name or prefix (e.g. "H1").  Defaults to the first found.
         fov: FOV folder name (e.g. "000").  Defaults to the first found.
-        scale: voxel size [z, y, x] in µm; read from render_params.json if None.
+        scale: voxel size [z, y, x] in µm; read from metadata file if None.
 
     Returns:
         (napari.Viewer, dict of channel arrays)
@@ -170,23 +198,13 @@ def view_output(
     output_dir = Path(output_dir)
 
     params_path = output_dir / "render_params.json"
-    if not params_path.exists():
-        raise FileNotFoundError(
-            f"render_params.json not found in {output_dir}. "
-            "Pass n_z and channel_names explicitly via load_fov()."
-        )
-    with open(params_path) as f:
-        params = json.load(f)
+    scene_meta_path = output_dir / "scene_meta.json"
 
-    n_z = params["derived"]["volume_shape_voxels"][0]
-    channel_names = _channel_names_from_params(params)
-    if scale is None:
-        scale = params["args"].get("pixel_size", [0.4, 0.1084333, 0.1084333])
-
+    # Locate hyb and fov first so we can pass the zarr path to _meta_from_scene_meta
+    # for DAPI autodetection.
     hyb_folders = _find_hyb_folders(output_dir)
     if not hyb_folders:
         raise FileNotFoundError(f"No hyb folders found in {output_dir}")
-
     if hyb is not None:
         hyb_folders = [h for h in hyb_folders if h.name.startswith(hyb)]
         if not hyb_folders:
@@ -196,12 +214,30 @@ def view_output(
     fov_paths = _find_fov_paths(hyb_folder)
     if not fov_paths:
         raise FileNotFoundError(f"No FOV data arrays found in {hyb_folder}")
-
     if fov is not None:
         fov_paths = [p for p in fov_paths if p.parent.name == fov]
         if not fov_paths:
             raise FileNotFoundError(f"FOV '{fov}' not found in {hyb_folder}")
     fov_data_path = fov_paths[0]
+
+    if params_path.exists():
+        with open(params_path) as f:
+            params = json.load(f)
+        n_z = params["derived"]["volume_shape_voxels"][0]
+        channel_names = _channel_names_from_params(params)
+        if scale is None:
+            scale = params["args"].get("pixel_size", [0.4, 0.1084333, 0.1084333])
+    elif scene_meta_path.exists():
+        n_z, channel_names, meta_scale = _meta_from_scene_meta(
+            scene_meta_path, fov_data_path
+        )
+        if scale is None:
+            scale = meta_scale
+    else:
+        raise FileNotFoundError(
+            f"No render_params.json or scene_meta.json found in {output_dir}. "
+            "Pass n_z and channel_names explicitly via load_fov()."
+        )
 
     print(f"Loading  {fov_data_path}")
     print(f"  n_z={n_z}  channels={channel_names}  scale={scale}")

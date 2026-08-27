@@ -24,8 +24,6 @@ Output layout:
                 ...
 """
 
-import os
-
 import argparse
 import concurrent.futures
 import json
@@ -35,17 +33,51 @@ from pathlib import Path
 from scipy import constants as k
 from scipy.fft import rfftn, irfftn, next_fast_len
 
-from fishsim.src import sim3d
 from fishsim.src.imaging import CameraSimulator
 from fishsim.scripts.render_images import (
-    DYE_REGISTRY,
     _resolve_dyes,
     load_psf,
-    prepare_psf_fft,
     _make_dapi_channel,
     _make_xml,
 )
 
+# ---------------------------------------------------------------------------
+# Per-process worker state.  Populated once by _init_worker so that large
+# shared arrays (psf_norm, dapi_im) are only pickled once per worker process
+# rather than once per submitted task.
+# ---------------------------------------------------------------------------
+_W: dict = {}
+
+
+def _init_worker(psf_norm, camera, dye_channels, dye_names,
+                 exposure_s, dapi_im, pixel_size, volume_um, n_bits, n_dyes):
+    _W["psf_norm"] = psf_norm
+    _W["camera"] = camera
+    _W["dye_channels"] = dye_channels
+    _W["dye_names"] = dye_names
+    _W["exposure_s"] = exposure_s
+    _W["dapi_im"] = dapi_im
+    _W["pixel_size"] = pixel_size
+    _W["volume_um"] = volume_um
+    _W["n_bits"] = n_bits
+    _W["n_dyes"] = n_dyes
+
+
+def _run_round(args):
+    """Top-level wrapper required for pickling under Windows spawn."""
+    round_num, vol_dir, hyb_folder, tile_idx = args
+    _convolve_and_render_round(
+        round_num, Path(vol_dir),
+        _W["psf_norm"], _W["dye_channels"], _W["dye_names"],
+        _W["camera"], _W["exposure_s"], _W["dapi_im"],
+        _W["pixel_size"], _W["volume_um"], _W["n_bits"], _W["n_dyes"],
+        Path(hyb_folder), tile_idx,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -77,7 +109,8 @@ def parse_args():
     p.add_argument("--brightness-scale", type=float, default=1.0)
     p.add_argument(
         "--num-round-workers", type=int, default=4,
-        help="Concurrent round renders per density level (default: 4)",
+        help="Concurrent round renders per density level (default: 4). "
+             "Each worker is a separate process with its own GIL.",
     )
     p.add_argument("--no-dapi", action="store_true", default=False)
     p.add_argument("--camera-spec-file", default=None, metavar="JSON")
@@ -85,6 +118,10 @@ def parse_args():
     p.add_argument("--camera-mode", default=None, metavar="MODE")
     return p.parse_args()
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _find_density_dirs(sweep_dir: Path) -> list[Path]:
     return sorted(d for d in sweep_dir.iterdir()
@@ -97,10 +134,14 @@ def _load_emitter_volume(vol_dir: Path, dye_idx: int, dye_name: str) -> np.ndarr
     return z[:]
 
 
+# ---------------------------------------------------------------------------
+# Per-round worker
+# ---------------------------------------------------------------------------
+
 def _convolve_and_render_round(
     round_num: int,
     vol_dir: Path,
-    psf: np.ndarray,
+    psf_norm: np.ndarray,
     dye_channels: list,
     dye_names: list,
     camera: CameraSimulator,
@@ -115,11 +156,6 @@ def _convolve_and_render_round(
 ) -> None:
     """Load emitter volumes for one round, convolve with PSF, write zarr."""
     import zarr
-
-    # Normalise PSF the same way prepare_psf_fft does.
-    from fishsim.src import sim3d as _sim3d
-    psf_norm = _sim3d.apodize_psf_tukey(psf)
-    psf_norm = psf_norm / psf_norm.sum()
 
     round_start = round_num * n_dyes
     bits_active = [round_start + di < n_bits for di in range(n_dyes)]
@@ -138,10 +174,8 @@ def _convolve_and_render_round(
         tag = f"H{round_num+1} dye{dye_idx}"
         t0 = time.time()
         emitter_vol = _load_emitter_volume(vol_dir, dye_idx, dye_names[dye_idx])
-        print(f"  [{tag}] load       {time.time()-t0:.1f}s  shape={emitter_vol.shape}", flush=True)
+        print(f"  [{tag}] load        {time.time()-t0:.1f}s  shape={emitter_vol.shape}", flush=True)
 
-        # Full-volume convolution with multithreaded scipy.fft (works on AMD CPUs
-        # unlike numpy FFT which ignores MKL threading on non-Intel hardware).
         t0 = time.time()
         fft_shape = tuple(next_fast_len(emitter_vol.shape[i] + psf_norm.shape[i] - 1)
                           for i in range(emitter_vol.ndim))
@@ -150,8 +184,7 @@ def _convolve_and_render_round(
         raw = irfftn(fa * fb, s=fft_shape, workers=-1)
         print(f"  [{tag}] fftconvolve {time.time()-t0:.1f}s  fft_shape={fft_shape}", flush=True)
 
-        # Trim to 'same': centered on emitter_vol shape
-        starts = tuple((psf_norm.shape[i] - 1) // 2 for i in range(raw.ndim))
+        starts = tuple(psf_norm.shape[i] // 2 for i in range(raw.ndim))
         slices = tuple(slice(st, st + emitter_vol.shape[i])
                        for i, st in enumerate(starts))
         photon_base = np.clip(raw[slices], 0, None).astype(np.float32)
@@ -195,8 +228,12 @@ def _convolve_and_render_round(
         n_channels=n_channels_total,
     )
     (hyb_folder / f"Conv_zscan__{fov_str}.xml").write_text(xml, encoding="ISO-8859-1")
-    print(f"  [H{round_num+1} tile{tile_idx}] {fov_path/'data'}  shape={stacked.shape}")
+    print(f"  [H{round_num+1} tile{tile_idx}] {fov_path/'data'}  shape={stacked.shape}", flush=True)
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     args = parse_args()
@@ -209,7 +246,6 @@ def main():
     if not density_dirs:
         raise FileNotFoundError(f"No density_* directories found in {sweep_dir}")
 
-    # Read shared metadata from the first density level.
     first_meta_path = density_dirs[0] / "emitter_volumes_meta.json"
     if not first_meta_path.exists():
         raise FileNotFoundError(
@@ -250,12 +286,10 @@ def main():
     else:
         qe_map = {wl: 0.85 for wl in dye_wavelengths}
         camera = CameraSimulator(
-            QE=qe_map, gain=1.0 / 0.25, bias=100,
+            QE=qe_map, gain=0.25, bias=100,
             dark_current=1.0, read_noise=1.8, well_depth=15000,
         )
 
-    # DAPI: use cells.csv from the original scene directory if present.
-    # The sweep_dir should contain a link or copy; fall back to sweep_dir itself.
     dapi_im = None
     if not args.no_dapi:
         cells_csv = sweep_dir / "cells.csv"
@@ -265,48 +299,56 @@ def main():
             print(f"Generating DAPI from {len(cells_df)} cells...")
             dapi_im = _make_dapi_channel(cells_df, volume_shape, pixel_size)
 
-    t0 = time.time()
+    t0_total = time.time()
 
     for psf_file, psf_label in zip(args.psf_files, psf_labels):
         print(f"\n=== PSF: {psf_label} ({psf_file}) ===")
-        psf = load_psf(
+        psf_raw = load_psf(
             Path(psf_file), args.psf_channel,
             args.psf_position[0], args.psf_position[1],
         )
+        from fishsim.src import sim3d as _sim3d
+        psf_norm = _sim3d.apodize_psf_tukey(psf_raw)
+        psf_norm = (psf_norm / psf_norm.sum()).astype(np.float32)
+
         psf_out_dir = output_dir / psf_label
 
-        for density_dir in density_dirs:
-            density_label = density_dir.name
-            print(f"\n--- {density_label} ---")
+        # One process pool per PSF: workers are initialised once with psf_norm,
+        # camera, dapi_im, etc. and reused across all density levels.
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=args.num_round_workers,
+            initializer=_init_worker,
+            initargs=(
+                psf_norm, camera, dye_channels, dye_names,
+                exposure_s, dapi_im, pixel_size, volume_um, n_bits, n_dyes,
+            ),
+        ) as pool:
+            for density_dir in density_dirs:
+                density_label = density_dir.name
+                print(f"\n--- {density_label} ---")
 
-            with open(density_dir / "emitter_volumes_meta.json") as f:
-                level_meta = json.load(f)
+                with open(density_dir / "emitter_volumes_meta.json") as f:
+                    level_meta = json.load(f)
 
-            # Copy scene_meta so downstream tools can read it.
-            level_out_dir = psf_out_dir / density_label
-            level_out_dir.mkdir(parents=True, exist_ok=True)
-            with open(level_out_dir / "scene_meta.json", "w") as f:
-                json.dump({**level_meta, "psf_label": psf_label,
-                           "psf_file": str(psf_file)}, f, indent=2)
+                level_out_dir = psf_out_dir / density_label
+                level_out_dir.mkdir(parents=True, exist_ok=True)
+                with open(level_out_dir / "scene_meta.json", "w") as f:
+                    json.dump({**level_meta, "psf_label": psf_label,
+                               "psf_file": str(psf_file)}, f, indent=2)
 
-            # Copy groundtruth CSVs verbatim (spot positions are PSF-independent).
-            for gt_csv in density_dir.glob("tile_*_groundtruth.csv"):
-                import shutil
-                shutil.copy2(gt_csv, level_out_dir / gt_csv.name)
+                for gt_csv in density_dir.glob("tile_*_groundtruth.csv"):
+                    import shutil
+                    shutil.copy2(gt_csv, level_out_dir / gt_csv.name)
 
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=args.num_round_workers
-            ) as pool:
                 futures = {
                     pool.submit(
-                        _convolve_and_render_round,
-                        round_num,
-                        density_dir / "emitter_volumes" / f"H{round_num + 1}",
-                        psf, dye_channels, dye_names,
-                        camera, exposure_s, dapi_im,
-                        pixel_size, volume_um, n_bits, n_dyes,
-                        level_out_dir / f"H{round_num + 1}_{tag}_set{set_num}",
-                        tile_idx=0,
+                        _run_round,
+                        (
+                            round_num,
+                            str(density_dir / "emitter_volumes" / f"H{round_num + 1}"),
+                            str(level_out_dir / f"H{round_num + 1}_{tag}_set{set_num}"),
+                            0,
+                        ),
                     ): round_num
                     for round_num in range(n_rounds)
                 }
@@ -319,7 +361,7 @@ def main():
                             f"Round {rn + 1} failed for {psf_label}/{density_label}"
                         ) from exc
 
-    elapsed_s = time.time() - t0
+    elapsed_s = time.time() - t0_total
     print(f"\nPSF sweep complete in {elapsed_s/60:.1f} min. Output in {output_dir}")
 
 
