@@ -207,12 +207,11 @@ def _convolve_and_render_round(
     fov_str = f"{tile_idx:03d}"
     hyb_folder.mkdir(parents=True, exist_ok=True)
     fov_path = hyb_folder / fov_str
-    zarr.open_group(str(fov_path), mode="w", zarr_format=2)
+    zarr.open_group(str(fov_path), mode="w")
     z_arr = zarr.open_array(
         str(fov_path / "data"), mode="w",
         shape=stacked.shape, dtype="uint16",
         chunks=(1, *stacked.shape[1:]),
-        zarr_format=2,
     )
     z_arr[:] = stacked
     (hyb_folder / f"Conv_zscan__{fov_str}.zarr").mkdir(exist_ok=True)

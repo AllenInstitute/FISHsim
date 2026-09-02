@@ -297,7 +297,6 @@ def _render_round(
                 shape=emitter_accum[dye_idx].shape, dtype="float32",
                 chunks=emitter_accum[dye_idx].shape,
                 compressor=compressor,
-                zarr_format=2,
             )
             z[:] = emitter_accum[dye_idx]
 
@@ -318,12 +317,11 @@ def _render_round(
     hyb_folder.mkdir(parents=True, exist_ok=True)
 
     fov_path = hyb_folder / fov_str
-    zarr.open_group(str(fov_path), mode="w", zarr_format=2)
+    zarr.open_group(str(fov_path), mode="w")
     z_arr = zarr.open_array(
         str(fov_path / "data"), mode="w",
         shape=stacked.shape, dtype="uint16",
         chunks=(1, *stacked.shape[1:]),
-        zarr_format=2,
     )
     z_arr[:] = stacked
 

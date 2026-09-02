@@ -655,15 +655,14 @@ def main():
 
             # 1. FOV zarr group + image data array inside it.
             # The FOV directory must be a zarr group (.zgroup) with the image
-            # array at <fov>/data/ (.zarray + chunks).  zarr_format=2 forces
-            # the v2 layout (dot-separated chunk names, no c/ subdirectory).
+            # array at <fov>/data/ (.zarray + chunks). zarr 2.x always writes
+            # v2 layout (dot-separated chunk names) by default.
             fov_path = hyb_folder / fov_str
-            zarr.open_group(str(fov_path), mode="w", zarr_format=2)
+            zarr.open_group(str(fov_path), mode="w")
             z_arr = zarr.open_array(
                 str(fov_path / "data"), mode="w",
                 shape=stacked.shape, dtype="uint16",
                 chunks=(1, *stacked.shape[1:]),
-                zarr_format=2,
             )
             z_arr[:] = stacked
 
