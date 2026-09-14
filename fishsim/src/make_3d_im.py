@@ -1,7 +1,9 @@
 from pathlib import Path
 from fishsim.src import sim3d, point_cloud_background
 from fishsim.src.imaging import CameraSimulator, CY3
+from fishsim.src.visualization import visualize_center_cell
 from fishsim import config
+import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 from scipy import constants as k
@@ -105,5 +107,17 @@ def main(
     camera = CameraSimulator(QE={561: 0.8}, gain=0.25, bias=100,
                              dark_current=1., read_noise=0, well_depth=15000)
     noisy_image = camera.simulate_image(tile_photon_im, 561, exposure_s)
+
+    viz_savepath = Path(ground_truth[0]).parent.parent / "center_cell_ortho.png"
+    visualize_center_cell(
+        noisy_image,
+        df,
+        sim.cells,
+        voxel_size=pixel_size,
+        sample_volume_zyx=sample_volume,
+        padding_um=10.0,
+        savepath=viz_savepath,
+    )
+    plt.show()
 
     return (tile_photon_im, bg_mask, noisy_image, df)
