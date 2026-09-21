@@ -156,28 +156,28 @@ def ortho_figure(image_crop, voxel_size, origin_zyx, df_crop, spots_vox, cell):
     #   bottom edge = last row = high y/z value
     panels = [
         dict(
-            proj=image_crop.mean(axis=0),            # (ny, nx)
+            proj=image_crop.max(axis=0),             # (ny, nx)
             extent=[x_lo, x_hi, y_hi, y_lo],
             xlabel='x (µm)', ylabel='y (µm)',
-            title='XY — top view (Z projection)',
+            title='XY — top view (Z max projection)',
             gt=(df_crop['x'].values, df_crop['y'].values),
             det=(sp_x, sp_y),
             boundary=_projected_ellipse_boundary(M, center, (0, 1)),
         ),
         dict(
-            proj=image_crop.mean(axis=1),            # (nz, nx)
+            proj=image_crop.max(axis=1),             # (nz, nx)
             extent=[x_lo, x_hi, z_hi, z_lo],
             xlabel='x (µm)', ylabel='z (µm)',
-            title='XZ — side view (Y projection)',
+            title='XZ — side view (Y max projection)',
             gt=(df_crop['x'].values, df_crop['z'].values),
             det=(sp_x, sp_z),
             boundary=_projected_ellipse_boundary(M, center, (0, 2)),
         ),
         dict(
-            proj=image_crop.mean(axis=2),            # (nz, ny)
+            proj=image_crop.max(axis=2),             # (nz, ny)
             extent=[y_lo, y_hi, z_hi, z_lo],
             xlabel='y (µm)', ylabel='z (µm)',
-            title='YZ — front view (X projection)',
+            title='YZ — front view (X max projection)',
             gt=(df_crop['y'].values, df_crop['z'].values),
             det=(sp_y, sp_z),
             boundary=_projected_ellipse_boundary(M, center, (1, 2)),
@@ -251,10 +251,13 @@ def visualize_center_cell(
 
     Returns: matplotlib Figure
     """
-    _, cell = find_center_cell(cells, sample_volume_zyx)
+    center_idx, cell = find_center_cell(cells, sample_volume_zyx)
     crop, df_crop, origin_zyx = crop_image_and_points(
         image, df, cell, voxel_size, padding_um
     )
+    # Keep only GT points belonging to the center cell; neighbours share the AABB
+    if 'cell_id' in df_crop.columns:
+        df_crop = df_crop[df_crop['cell_id'] == center_idx]
     spots_vox = detect_spots_3d(
         crop, voxel_size,
         sigma_um=sigma_um,
