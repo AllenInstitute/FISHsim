@@ -58,18 +58,32 @@ def make_dark_current_image(
 class DyeSimulator:
     """Convert a PSF-convolved intensity image to simulated photon counts.
 
-    Models fluorophore emission as a Poisson process parameterised by
-    fluorescence lifetime and quantum yield, ignoring excitation cross-section
-    (calibrated out via the brightness_scale multiplier in render_images.py).
+    Models fluorophore emission as a Poisson process.  The effective photon
+    emission rate is set by *photons_per_emitter_s* (photons/emitter/second),
+    which represents the laser-driven emission rate under typical FISH
+    illumination.  This replaces the unphysical QY/lifetime formulation, which
+    assumes one excitation per lifetime cycle (saturation limit: ~5×10^8 Hz for
+    Cy3) — roughly 10,000× higher than real FISH conditions and causes full
+    camera-well saturation.
 
     Args:
-        lifetime: fluorescence lifetime in seconds (e.g. 2e-9 for Cy3)
-        quantum_yield: probability of photon emission per excitation event
+        lifetime: fluorescence lifetime in seconds (retained for reference)
+        quantum_yield: probability of photon emission per excitation (retained
+            for reference; not used in the photon-count calculation when
+            photons_per_emitter_s is set)
+        photons_per_emitter_s: effective photon emission rate per emitter per
+            second at the focal plane under typical FISH illumination.
+            Multiply by exposure_time to get total expected photons per emitter
+            per frame.  Default 2.5e5 gives ~12,500 photons per emitter at
+            50 ms exposure — appropriate for a bright FISH dye with a Kinetix
+            camera in sensitivity mode (1000 e well depth, 0.25 e/count gain).
     """
 
-    def __init__(self, lifetime: float, quantum_yield: float):
+    def __init__(self, lifetime: float, quantum_yield: float,
+                 photons_per_emitter_s: float = 2.5e5):
         self.lifetime = lifetime
         self.quantum_yield = quantum_yield
+        self.photons_per_emitter_s = photons_per_emitter_s
 
     def psf_to_photon_distribution(
         self,
@@ -79,7 +93,7 @@ class DyeSimulator:
         """Convert a (normalised) PSF image to expected photon counts and draw Poisson samples.
 
         Args:
-            psf: PSF-convolved intensity image in arbitrary units.
+            psf: PSF-convolved emitter density image (normalised, sum ≈ N_emitters).
                  Can be a numpy array or a dask array.
             exposure_time: effective exposure time in seconds. Multiply the
                  physical exposure by a brightness_scale multiplier before
@@ -88,7 +102,7 @@ class DyeSimulator:
         Returns:
             Poisson-sampled photon counts with the same shape as *psf*.
         """
-        expected_photons = psf * self.quantum_yield * exposure_time / self.lifetime
+        expected_photons = psf * (self.photons_per_emitter_s * exposure_time)
 
         if isinstance(psf, np.ndarray):
             return np.random.poisson(expected_photons.astype(np.float64))
@@ -97,10 +111,13 @@ class DyeSimulator:
 
 
 # Convenience instances for common fluorophores.
-# Import and use these, or construct your own DyeSimulator for different dyes.
-CY3 = DyeSimulator(lifetime=2.0e-9, quantum_yield=0.3)
-CY5 = DyeSimulator(lifetime=1.0e-9, quantum_yield=0.28)
-AF750 = DyeSimulator(lifetime=0.7e-9, quantum_yield=0.12)
+# photons_per_emitter_s = 2.5e5 → 12,500 photons/emitter at 50 ms exposure.
+# At PSF peak (~4% of energy) with Kinetix sensitivity mode (QE≈0.95,
+# well=1000 e, gain=0.25 e/count): ~475 electrons → ~2000 ADU, above the
+# default mermake_threshold=1800 without saturating the well.
+CY3 = DyeSimulator(lifetime=2.0e-9, quantum_yield=0.3, photons_per_emitter_s=2.5e5)
+CY5 = DyeSimulator(lifetime=1.0e-9, quantum_yield=0.28, photons_per_emitter_s=2.5e5)
+AF750 = DyeSimulator(lifetime=0.7e-9, quantum_yield=0.12, photons_per_emitter_s=2.5e5)
 
 
 # ---------------------------------------------------------------------------
