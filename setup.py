@@ -7,6 +7,10 @@ setup(
     author_email='jenkin.tsui@aya.yale.edu',
     description='A simulator for barcoding images',
     packages=find_packages(),
+    package_data={
+        'fishsim': ['resources/**/*'],
+    },
+    include_package_data=True,
     install_requires=[
         'numpy',
         'matplotlib',
