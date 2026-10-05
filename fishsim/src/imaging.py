@@ -115,9 +115,9 @@ class DyeSimulator:
 # At PSF peak (~4% of energy) with Kinetix sensitivity mode (QE≈0.95,
 # well=1000 e, gain=0.25 e/count): ~475 electrons → ~2000 ADU, above the
 # default mermake_threshold=1800 without saturating the well.
-CY3 = DyeSimulator(lifetime=2.0e-9, quantum_yield=0.3, photons_per_emitter_s=2.5e5)
-CY5 = DyeSimulator(lifetime=1.0e-9, quantum_yield=0.28, photons_per_emitter_s=2.5e5)
-AF750 = DyeSimulator(lifetime=0.7e-9, quantum_yield=0.12, photons_per_emitter_s=2.5e5)
+CY3 = DyeSimulator(lifetime=2.0e-9, quantum_yield=0.3, photons_per_emitter_s=2.2e6)
+CY5 = DyeSimulator(lifetime=1.0e-9, quantum_yield=0.28, photons_per_emitter_s=2.2e6)
+AF750 = DyeSimulator(lifetime=0.7e-9, quantum_yield=0.12, photons_per_emitter_s=2.2e6)
 
 
 # ---------------------------------------------------------------------------

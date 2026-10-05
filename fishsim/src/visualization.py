@@ -94,7 +94,7 @@ def crop_image_and_points(image, df, cell, voxel_size, padding_um=10.0):
     return crop, df[mask].copy(), (z0, y0, x0)
 
 
-def detect_spots_3d(image_crop, voxel_size, sigma_um=0.3, min_sep_um=0.5, threshold_rel=0.15):
+def detect_spots_3d(image_crop, voxel_size, sigma_um=0.3, min_sep_um=0.5, threshold_rel=0.6):
     """Detect local-maxima in a 3D image crop as candidate transcript locations.
 
     Args:
