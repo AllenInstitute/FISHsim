@@ -325,6 +325,12 @@ def _render_round(
     )
     z_arr[:] = stacked
 
+    image_data = stacked[1:]  # skip blank frame
+    sat_val = np.iinfo(np.uint16).max
+    sat_frac = (image_data == sat_val).mean()
+    pct999 = np.percentile(image_data, 99.9)
+    print(f"  [H{round_num+1} tile{tile_idx}] saturation: {sat_frac:.2%} of pixels at uint16 max, 99.9th pct = {pct999:.0f}")
+
     (hyb_folder / f"Conv_zscan__{fov_str}.zarr").mkdir(exist_ok=True)
 
     dz = pixel_size[0]
